@@ -360,6 +360,9 @@ EXTENSIONS = [
     Extension("VK_KHR_shader_fma",
               alias="fma",
               features=True),
+    Extension("VK_KHR_video_queue"),
+    Extension("VK_KHR_video_decode_queue"),
+    Extension("VK_KHR_video_decode_h264"),
 ]
 
 # constructor: Versions(device_version(major, minor, patch), struct_version(major, minor))
