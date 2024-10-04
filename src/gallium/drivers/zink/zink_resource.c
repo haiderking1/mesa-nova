@@ -892,8 +892,6 @@ init_ici(struct zink_screen *screen, VkImageCreateInfo *ici, const struct pipe_r
          VkVideoFormatPropertiesKHR *fprop = &prop_obj.pVideoFormatProperties[i];
          if (fprop->format != ici->format)
             continue;
-         if (modifiers_count && fprop->imageTiling == VK_IMAGE_TILING_OPTIMAL)
-            continue;
          if ((templ->flags & ZINK_RESOURCE_FLAG_VIDEO_OUTPUT) &&
              !(fprop->imageCreateFlags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT))
             continue;
