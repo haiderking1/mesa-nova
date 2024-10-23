@@ -57,6 +57,9 @@ zink_destroy_video_codec(struct pipe_video_codec *codec) {
    struct zink_video_codec *zvc = (struct zink_video_codec *)codec;
    struct zink_screen *screen = (struct zink_screen *)zvc->screen;
 
+   simple_mtx_lock(screen->queue_lock);
+   VKSCR(QueueWaitIdle)(screen->queue_video_decode);
+   simple_mtx_unlock(screen->queue_lock);
    if (!zvc->coincide_dpb) {
       for (unsigned i = 0; i < zvc->max_dpb_slots; i++)
          VKSCR(DestroyImageView)(screen->dev, zvc->dpb_resources[i].imageViewBinding, NULL);
@@ -71,6 +74,7 @@ zink_destroy_video_codec(struct pipe_video_codec *codec) {
    }
    u_upload_unmap(zvc->bitstream_mgr);
    u_upload_destroy(zvc->bitstream_mgr);
+   zink_resource_reference(&zvc->bitstream_res, NULL);
    for (unsigned i = 0; i < zvc->num_priv_mems; i++)
       zink_bo_unref(screen, zvc->priv_mems[i]);
 
@@ -80,7 +84,6 @@ zink_destroy_video_codec(struct pipe_video_codec *codec) {
    }
    /* ensure session is no longer in use */
    VKSCR(QueueWaitIdle)(screen->queue_video_decode);
-   VKSCR(DestroyCommandPool)(screen->dev, zvc->cmdpool, NULL);
    VKSCR(DestroyVideoSessionKHR)(screen->dev,
                                  zvc->session, NULL);
    free(zvc);
@@ -92,6 +95,9 @@ zink_destroy_associated_data(void *data)
    struct zink_video_surf_data *surf = data;
    struct zink_video_codec *zvc = (struct zink_video_codec *)surf->codec;
    struct zink_screen *screen = (struct zink_screen *)zvc->screen;
+   simple_mtx_lock(screen->queue_lock);
+   VKSCR(QueueWaitIdle)(screen->queue_video_decode);
+   simple_mtx_unlock(screen->queue_lock);
    VKSCR(DestroyImageView)(screen->dev, surf->resource.imageViewBinding, NULL);
 
    for (unsigned i = 0; i < zvc->max_dpb_slots; i++) {
@@ -101,6 +107,14 @@ zink_destroy_associated_data(void *data)
    }
    /* destroy iv */
    free(surf);
+}
+
+static VkImageViewUsageCreateInfo
+video_view_usage(struct zink_resource *res)
+{
+   VkImageViewUsageCreateInfo usage_info = { VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO };
+   usage_info.usage = res->obj->vkusage & (VK_IMAGE_USAGE_VIDEO_DECODE_DST_BIT_KHR | VK_IMAGE_USAGE_VIDEO_DECODE_DPB_BIT_KHR);
+   return usage_info;
 }
 
 static void
@@ -113,6 +127,11 @@ zink_video_create_session(struct zink_video_codec *zvc,
    struct zink_screen *screen = (struct zink_screen *)zvc->base.context->screen;
    uint32_t bit_depth = zink_video_get_format_bit_depth(format);
    struct zink_video_profile vk_profile = { 0 };
+   /* VA creates surfaces before the stream profile is known, but the profile
+    * must be specified at image creation. HIGH profile is most compatible, so
+    * use that for now
+    */
+   profile = PIPE_VIDEO_PROFILE_MPEG4_AVC_HIGH;
    zink_video_fill_single_profile(screen, profile, bit_depth, &vk_profile);
 
    struct zink_video_caps_info caps_info = { 0 };
@@ -146,6 +165,9 @@ zink_video_create_session(struct zink_video_codec *zvc,
             psurf.first_layer = psurf.last_layer = i;
             VkImageViewCreateInfo ivci = create_ivci(screen, zink_resource(zvc->dpb_res[0]),
                                                      &psurf, PIPE_TEXTURE_2D);
+            ivci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            VkImageViewUsageCreateInfo usage_info = video_view_usage(zink_resource(zvc->dpb_res[0]));
+            ivci.pNext = &usage_info;
             zvc->dpb_resources[i].sType = VK_STRUCTURE_TYPE_VIDEO_PICTURE_RESOURCE_INFO_KHR;
             zvc->dpb_resources[i].pNext = NULL;
             zvc->dpb_resources[i].codedExtent.width = width;
@@ -162,6 +184,9 @@ zink_video_create_session(struct zink_video_codec *zvc,
             zvc->dpb_resources[i].codedExtent.height = height;
             VkImageViewCreateInfo ivci = create_ivci(screen, zink_resource(zvc->dpb_res[i]),
                                                      &psurf, PIPE_TEXTURE_2D);
+            ivci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            VkImageViewUsageCreateInfo usage_info = video_view_usage(zink_resource(zvc->dpb_res[i]));
+            ivci.pNext = &usage_info;
             VKSCR(CreateImageView)(screen->dev, &ivci, NULL, &zvc->dpb_resources[i].imageViewBinding);
          }
       }
@@ -174,6 +199,7 @@ zink_video_create_session(struct zink_video_codec *zvc,
 
    VkVideoSessionCreateInfoKHR sci = { 0 };
    sci.sType = VK_STRUCTURE_TYPE_VIDEO_SESSION_CREATE_INFO_KHR;
+   sci.queueFamilyIndex = screen->video_decode_queue;
    sci.pVideoProfile = &vk_profile.profile;
    sci.maxCodedExtent.width = width;
    sci.maxCodedExtent.height = height;
@@ -224,7 +250,7 @@ zink_video_create_session(struct zink_video_codec *zvc,
       bind_memory[i].memory = mem;
       bind_memory[i].memoryBindIndex = session_memory_reqs[i].memoryBindIndex;
       bind_memory[i].memoryOffset = 0;
-      bind_memory[i].memorySize = zink_bo_get_size(zvc->priv_mems[i]);
+      bind_memory[i].memorySize = session_memory_reqs[i].memoryRequirements.size;
    }
    VKSCR(BindVideoSessionMemoryKHR)(screen->dev, zvc->session,
                                     mem_req_count, bind_memory);
@@ -242,6 +268,7 @@ zink_begin_frame(struct pipe_video_codec *codec,
    struct zink_screen *screen = zink_screen(ctx->base.screen);
    struct pipe_resource *bitstream_pres = NULL;
    unsigned offset;
+   zink_resource_reference(&zvc->bitstream_res, NULL);
    u_upload_alloc_ref(zvc->bitstream_mgr, 0, get_zvc_bitstream_size(zvc),
                       screen->info.props.limits.minMemoryMapAlignment, &offset,
                       (struct pipe_resource **)&bitstream_pres, (void **)&zvc->bs_ptr);
@@ -254,6 +281,14 @@ zink_begin_frame(struct pipe_video_codec *codec,
                                 target->buffer_format,
                                 codec->profile, codec->entrypoint);
 
+   if (zvc->dpb_array) {
+      zink_batch_reference_resource_rw(ctx, zink_resource(zvc->dpb_res[0]), true);
+   } else {
+      for (unsigned i = 0; i < zvc->max_dpb_slots; i++) {
+         if (zvc->dpb_res[i])
+            zink_batch_reference_resource_rw(ctx, zink_resource(zvc->dpb_res[i]), true);
+      }
+   }
 }
 
 static void
@@ -391,6 +426,9 @@ create_surf(struct zink_video_codec *zvc,
    struct pipe_surface psurf = {};
    psurf.format = target->buffer_format;
    VkImageViewCreateInfo ivci = create_ivci(screen, luma, &psurf, PIPE_TEXTURE_2D);
+   ivci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+   VkImageViewUsageCreateInfo usage_info = video_view_usage(luma);
+   ivci.pNext = &usage_info;
 
    VKSCR(CreateImageView)(screen->dev, &ivci, NULL, &surf->resource.imageViewBinding);
 
@@ -405,14 +443,14 @@ end_bitstream(struct zink_video_codec *zvc)
 }
 
 static void
-end_coding(struct zink_screen *screen,
+end_coding(struct zink_context *ctx,
            struct zink_video_codec *zvc,
            VkCommandBuffer cmdbuf)
 {
    VkVideoEndCodingInfoKHR eci = { 0 };
    eci.sType = VK_STRUCTURE_TYPE_VIDEO_END_CODING_INFO_KHR;
 
-   VKSCR(CmdEndVideoCodingKHR)(cmdbuf, &eci);
+   VKCTX(CmdEndVideoCodingKHR)(cmdbuf, &eci);
 
    struct zink_resource *zbs = zvc->bitstream_res;
    VkBufferMemoryBarrier2KHR bitstream_bmb;
@@ -422,42 +460,81 @@ end_coding(struct zink_screen *screen,
    bitstream_bmb.srcAccessMask = VK_ACCESS_2_VIDEO_DECODE_READ_BIT_KHR;
    bitstream_bmb.dstStageMask = VK_PIPELINE_STAGE_2_NONE_KHR;
    bitstream_bmb.dstAccessMask = VK_ACCESS_2_NONE_KHR;
-   bitstream_bmb.srcQueueFamilyIndex = zbs->queue;
+   bitstream_bmb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
    bitstream_bmb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
    bitstream_bmb.buffer = zbs->obj->buffer;
    bitstream_bmb.size = align64(zvc->bs_size, zvc->srcbuf_align);
    bitstream_bmb.offset = 0;
-   zbs->queue = VK_QUEUE_FAMILY_IGNORED;
 
    VkDependencyInfoKHR di = { 0 };
    di.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR;
    di.dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT;
    di.bufferMemoryBarrierCount = 1;
    di.pBufferMemoryBarriers = &bitstream_bmb;
-   /* TODO image barriers */
-   VKSCR(CmdPipelineBarrier2KHR)(cmdbuf, &di);
+   VKCTX(CmdPipelineBarrier2KHR)(cmdbuf, &di);
 
-   if (VKSCR(EndCommandBuffer)(cmdbuf) != VK_SUCCESS) {
-      debug_printf("vkEndCommandBuffer failed\n");
+   ctx->bs->video_params = zvc->params;
+   ctx->bs->has_work = true;
+   ctx->video_batch = false;
+   ctx->base.flush(&ctx->base, NULL, 0);
+   zink_resource_reference(&zvc->bitstream_res, NULL);
+}
+
+static void
+video_image_barrier(struct zink_context *ctx, VkCommandBuffer cmdbuf, struct zink_resource *res, VkImageLayout layout)
+{
+   struct zink_screen *screen = zink_screen(ctx->base.screen);
+   bool is_foreign = false;
+   bool needs_barrier = false;
+   bool same_layout = true;
+   zink_batch_reference_resource_rw(ctx, res, true);
+   for (struct zink_resource *plane = res; plane; plane = zink_resource(plane->base.b.next)) {
+      is_foreign |= plane->queue == VK_QUEUE_FAMILY_FOREIGN_EXT;
+      needs_barrier |= plane->layout != layout;
+      same_layout &= plane->layout == res->layout;
+   }
+   if (!needs_barrier && !is_foreign)
+      return;
+
+   VkImageMemoryBarrier2KHR imb[3] = { 0 };
+   unsigned num_imb = 0;
+   for (struct zink_resource *plane = res; plane; plane = zink_resource(plane->base.b.next)) {
+      if (!same_layout || plane == res) {
+         assert(num_imb < ARRAY_SIZE(imb));
+         imb[num_imb].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2_KHR;
+         imb[num_imb].srcStageMask = VK_PIPELINE_STAGE_2_NONE_KHR;
+         imb[num_imb].srcAccessMask = VK_ACCESS_2_NONE_KHR;
+         imb[num_imb].dstStageMask = VK_PIPELINE_STAGE_2_VIDEO_DECODE_BIT_KHR;
+         imb[num_imb].dstAccessMask = VK_ACCESS_2_VIDEO_DECODE_READ_BIT_KHR | VK_ACCESS_2_VIDEO_DECODE_WRITE_BIT_KHR;
+         imb[num_imb].oldLayout = plane->layout;
+         imb[num_imb].newLayout = layout;
+         imb[num_imb].srcQueueFamilyIndex = is_foreign ? VK_QUEUE_FAMILY_FOREIGN_EXT : VK_QUEUE_FAMILY_IGNORED;
+         imb[num_imb].dstQueueFamilyIndex = is_foreign ? screen->video_decode_queue : VK_QUEUE_FAMILY_IGNORED;
+         imb[num_imb].image = res->obj->image;
+         imb[num_imb].subresourceRange.aspectMask = same_layout ? VK_IMAGE_ASPECT_COLOR_BIT : plane->aspect;
+         imb[num_imb].subresourceRange.levelCount = VK_REMAINING_MIP_LEVELS;
+         imb[num_imb].subresourceRange.layerCount = VK_REMAINING_ARRAY_LAYERS;
+         num_imb++;
+      }
+      plane->layout = layout;
+      if (is_foreign)
+         plane->queue = VK_QUEUE_FAMILY_IGNORED;
    }
 
-   VkSubmitInfo si = {0};
-   si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-   si.waitSemaphoreCount = 0;
-   si.pWaitSemaphores = NULL;
-   si.signalSemaphoreCount = 0;
-   si.pSignalSemaphores = NULL;
-   VkPipelineStageFlags videoDecodeSubmitWaitStages = VK_PIPELINE_STAGE_2_VIDEO_DECODE_BIT_KHR;
-   si.pWaitDstStageMask = &videoDecodeSubmitWaitStages;
-   si.commandBufferCount = 1;
-   si.pCommandBuffers = &cmdbuf;
+   VkDependencyInfoKHR di = { 0 };
+   di.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR;
+   di.imageMemoryBarrierCount = num_imb;
+   di.pImageMemoryBarriers = imb;
+   VKCTX(CmdPipelineBarrier2KHR)(cmdbuf, &di);
 
-   VKSCR(QueueSubmit)(screen->queue_video_decode, 1, &si, NULL);
-   VKSCR(QueueWaitIdle)(screen->queue_video_decode);
-   VKSCR(FreeCommandBuffers)(screen->dev, zvc->cmdpool, 1, &cmdbuf);
-   VKSCR(DestroyVideoSessionParametersKHR)(screen->dev,
-                                           zvc->params, NULL);
+   res->obj->access = 0;
+   res->obj->access_stage = 0;
+}
 
+static struct zink_resource *
+video_buffer_resource(struct pipe_video_buffer *buf)
+{
+   return zink_resource(((struct vl_video_buffer *)buf)->resources[0]);
 }
 
 static int
@@ -466,6 +543,7 @@ zink_end_frame_h264(struct pipe_video_codec *codec,
                     struct pipe_picture_desc *picture)
 {
    struct zink_video_codec *zvc = (struct zink_video_codec *)codec;
+   struct zink_context *ctx = zink_context(codec->context);
    struct zink_screen *screen = (struct zink_screen *)zvc->screen;
    struct pipe_h264_picture_desc *h264 = (struct pipe_h264_picture_desc *)picture;
 
@@ -524,8 +602,8 @@ zink_end_frame_h264(struct pipe_video_codec *codec,
       h264_ref_info[i].PicOrderCnt[0] = h264->field_order_cnt_list[i][0];
       h264_ref_info[i].PicOrderCnt[1] = h264->field_order_cnt_list[i][1];
       h264_ref_info[i].FrameNum = h264->frame_num_list[i];
-      h264_ref_info[i].flags.top_field_flag = h264->top_is_reference[i];
-      h264_ref_info[i].flags.bottom_field_flag = h264->bottom_is_reference[i];
+      h264_ref_info[i].flags.top_field_flag = h264->top_is_reference[i] && !h264->bottom_is_reference[i];
+      h264_ref_info[i].flags.bottom_field_flag = h264->bottom_is_reference[i] && !h264->top_is_reference[i];
       h264_ref_info[i].flags.used_for_long_term_reference = h264->is_long_term[i];
 
       h264_dpb_info[i].sType = VK_STRUCTURE_TYPE_VIDEO_DECODE_H264_DPB_SLOT_INFO_KHR;
@@ -552,7 +630,8 @@ zink_end_frame_h264(struct pipe_video_codec *codec,
    setup_info.pPictureResource = zvc->coincide_dpb ? &surf->resource : &zvc->dpb_resources[surf->dpb_index];
    setup_info.pNext = &h264_dpb_setup_info;
    /* this must be added to the list of 'bound resources' */
-   ref_info[num_ref_frames++] = setup_info;
+   ref_info[num_ref_frames] = setup_info;
+   ref_info[num_ref_frames++].slotIndex = -1;
 
    StdVideoH264SequenceParameterSet sps = { 0 };
    StdVideoH264PictureParameterSet pps = { 0 };
@@ -581,19 +660,29 @@ zink_end_frame_h264(struct pipe_video_codec *codec,
 
    VKSCR(CreateVideoSessionParametersKHR)(screen->dev, &pci, NULL, &zvc->params);
 
-   VkCommandBuffer cmdbuf;
-   VkCommandBufferAllocateInfo cbai = {0};
-   cbai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-   cbai.commandPool = zvc->cmdpool;
-   cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-   cbai.commandBufferCount = 1;
+   if (!ctx->bs->is_video) {
+      ctx->video_batch = true;
+      ctx->bs->has_work = true;
+      ctx->base.flush(&ctx->base, NULL, 0);
+   }
+   VkCommandBuffer cmdbuf = ctx->bs->cmdbuf;
 
-   VKSCR(AllocateCommandBuffers)(screen->dev, &cbai, &cmdbuf);
-
-   VkCommandBufferBeginInfo cbbi = {0};
-   cbbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-   cbbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-   VKSCR(BeginCommandBuffer)(cmdbuf, &cbbi);
+   if (zvc->coincide_dpb) {
+      for (unsigned i = 0; i < h264->num_ref_frames && h264->ref[i]; i++)
+         video_image_barrier(ctx, cmdbuf, video_buffer_resource(h264->ref[i]), VK_IMAGE_LAYOUT_VIDEO_DECODE_DPB_KHR);
+      video_image_barrier(ctx, cmdbuf, video_buffer_resource(target), VK_IMAGE_LAYOUT_VIDEO_DECODE_DPB_KHR);
+   } else {
+      if (zvc->dpb_array) {
+         video_image_barrier(ctx, cmdbuf, zink_resource(zvc->dpb_res[0]), VK_IMAGE_LAYOUT_VIDEO_DECODE_DPB_KHR);
+      } else {
+         for (unsigned i = 0; i < h264->num_ref_frames && h264->ref[i]; i++) {
+            struct zink_video_surf_data *rsurf = vl_video_buffer_get_associated_data(h264->ref[i], &zvc->base);
+            video_image_barrier(ctx, cmdbuf, zink_resource(zvc->dpb_res[rsurf->dpb_index]), VK_IMAGE_LAYOUT_VIDEO_DECODE_DPB_KHR);
+         }
+         video_image_barrier(ctx, cmdbuf, zink_resource(zvc->dpb_res[surf->dpb_index]), VK_IMAGE_LAYOUT_VIDEO_DECODE_DPB_KHR);
+      }
+      video_image_barrier(ctx, cmdbuf, video_buffer_resource(target), VK_IMAGE_LAYOUT_VIDEO_DECODE_DST_KHR);
+   }
 
    VkVideoBeginCodingInfoKHR bci = { 0 };
    bci.sType = VK_STRUCTURE_TYPE_VIDEO_BEGIN_CODING_INFO_KHR;
@@ -616,23 +705,21 @@ zink_end_frame_h264(struct pipe_video_codec *codec,
    VkBufferMemoryBarrier2KHR bitstream_bmb;
    bitstream_bmb.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2_KHR;
    bitstream_bmb.pNext = NULL;
-   bitstream_bmb.srcStageMask = VK_PIPELINE_STAGE_2_NONE_KHR;
+   bitstream_bmb.srcStageMask = VK_PIPELINE_STAGE_2_HOST_BIT_KHR;
    bitstream_bmb.srcAccessMask = VK_ACCESS_2_HOST_WRITE_BIT_KHR;
    bitstream_bmb.dstStageMask = VK_PIPELINE_STAGE_2_VIDEO_DECODE_BIT_KHR;
    bitstream_bmb.dstAccessMask = VK_ACCESS_2_VIDEO_DECODE_READ_BIT_KHR;
-   bitstream_bmb.srcQueueFamilyIndex = zbs->queue;
-   bitstream_bmb.dstQueueFamilyIndex = screen->video_decode_queue;
+   bitstream_bmb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+   bitstream_bmb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
    bitstream_bmb.buffer = zbs->obj->buffer;
    bitstream_bmb.size = align64(zvc->bs_size, zvc->srcbuf_align);
    bitstream_bmb.offset = 0;
-   zbs->queue = screen->video_decode_queue;
 
    VkDependencyInfoKHR di = { 0 };
    di.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR;
    di.dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT;
    di.bufferMemoryBarrierCount = 1;
    di.pBufferMemoryBarriers = &bitstream_bmb;
-   /* TODO image barriers */
    VKSCR(CmdPipelineBarrier2KHR)(cmdbuf, &di);
 
    StdVideoDecodeH264PictureInfo pi = { 0 };
@@ -669,7 +756,7 @@ zink_end_frame_h264(struct pipe_video_codec *codec,
    vdi.srcBufferRange = align64(zvc->bs_size, zvc->srcbuf_align);
    VKSCR(CmdDecodeVideoKHR)(cmdbuf, &vdi);
 
-   end_coding(screen, zvc, cmdbuf);
+   end_coding(ctx, zvc, cmdbuf);
 
    return 0;
 }
@@ -681,7 +768,6 @@ zink_video_flush(struct pipe_video_codec *codec) {
 static struct pipe_video_codec *
 zink_create_video_codec(struct pipe_context *pctx, const struct pipe_video_codec *templat)
 {
-   struct zink_screen *screen = zink_screen(pctx->screen);
    struct zink_video_codec *zvc = CALLOC_STRUCT(zink_video_codec);
    if (!zvc) {
       return NULL;
@@ -699,11 +785,6 @@ zink_create_video_codec(struct pipe_context *pctx, const struct pipe_video_codec
    zvc->screen = pctx->screen;
    zvc->bitstream_mgr = u_upload_create(pctx, get_zvc_bitstream_size(zvc), ZINK_BIND_VIDEO, PIPE_USAGE_STAGING, 0);
 
-   VkCommandPoolCreateInfo cpci = {0};
-   cpci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-   cpci.queueFamilyIndex = screen->video_decode_queue;
-   if (VKSCR(CreateCommandPool)(screen->dev, &cpci, NULL, &zvc->cmdpool) != VK_SUCCESS)
-      return NULL;
    return &zvc->base;
 }
 
@@ -726,7 +807,7 @@ zink_video_buffer_create(struct pipe_context *pctx, const struct pipe_video_buff
    }
 
    struct zink_video_caps_info caps_info = { 0 };
-   zink_video_fill_caps(screen, PIPE_VIDEO_PROFILE_MPEG4_AVC_MAIN,
+   zink_video_fill_caps(screen, PIPE_VIDEO_PROFILE_MPEG4_AVC_HIGH,
                         PIPE_VIDEO_ENTRYPOINT_BITSTREAM, false,
                         &caps_info);
    if (caps_info.dec_caps.flags & VK_VIDEO_DECODE_CAPABILITY_DPB_AND_OUTPUT_COINCIDE_BIT_KHR) {
@@ -822,7 +903,7 @@ zink_video_fill_profiles(struct zink_screen *screen,
    if (screen->info.have_KHR_video_decode_h264 && (vid_format == PIPE_VIDEO_FORMAT_MPEG4_AVC ||
                                                    vid_format == PIPE_VIDEO_FORMAT_UNKNOWN)) {
       if (vid_format == PIPE_VIDEO_FORMAT_UNKNOWN)
-         profile = PIPE_VIDEO_PROFILE_MPEG4_AVC_MAIN;
+         profile = PIPE_VIDEO_PROFILE_MPEG4_AVC_HIGH;
       if (zink_video_fill_single_profile(screen, profile, luma_depth, &profiles->h264)) {
          profiles->profiles[profile_count] = profiles->h264.profile;
          profile_count++;
