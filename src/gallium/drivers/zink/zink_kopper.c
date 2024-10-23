@@ -806,6 +806,9 @@ kopper_present(void *data, void *gdata, int thread_idx)
       cpi->info.pWaitSemaphores = NULL;
       cpi->info.waitSemaphoreCount = 0;
    }
+   /* FIXME: delet this */
+   if (screen->VIDEO_PRESENT_HACK)
+      VKSCR(QueueWaitIdle)(screen->queue);
    simple_mtx_lock(&swapchain->lock);
    VkResult error2 = VKSCR(QueuePresentKHR)(screen->queue, &cpi->info);
    simple_mtx_unlock(&swapchain->lock);
