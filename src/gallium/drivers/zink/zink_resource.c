@@ -2983,6 +2983,13 @@ zink_image_map(struct pipe_context *pctx,
    struct zink_context *ctx = zink_context(pctx);
    struct zink_screen *screen = zink_screen(pctx->screen);
    struct zink_resource *res = zink_resource(pres);
+   if (ctx->flags & PIPE_CONTEXT_VIDEO) {
+      zink_resource_usage_wait(ctx, res, ZINK_RESOURCE_ACCESS_RW);
+      zink_screen_lock_context(screen);
+      void *map = zink_image_map(&screen->copy_context->base, pres, level, usage, box, transfer);
+      zink_screen_unlock_context(screen);
+      return map;
+   }
    if (res->unflushed_transient)
       res = res->transient;
    struct zink_transfer *trans = create_transfer(ctx, pres, usage, box);
@@ -3119,6 +3126,18 @@ zink_image_subdata(struct pipe_context *pctx,
    struct zink_resource *res = zink_resource(pres);
 
    res->subdata = true;
+   if (ctx->flags & PIPE_CONTEXT_VIDEO) {
+      /* video context only uses video queue and cannot access transfer ops */
+      zink_screen_lock_context(screen);
+      zink_image_subdata(&screen->copy_context->base, pres, level, usage, box, data, stride, layer_stride);
+      res->subdata = true;
+      /* add inter-context semaphore for synchronization */
+      zink_batch_sync_with_copy_context(ctx);
+      screen->copy_context->base.flush(&screen->copy_context->base, NULL, 0);
+      zink_screen_unlock_context(screen);
+      return;
+   }
+
    /* flush clears to avoid subdata conflict */
    if (!(usage & TC_TRANSFER_MAP_THREADED_UNSYNC) &&
        (res->obj->vkusage & VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT))
@@ -3533,7 +3552,19 @@ static void
 zink_image_unmap(struct pipe_context *pctx, struct pipe_transfer *ptrans)
 {
    struct zink_screen *screen = zink_screen(pctx->screen);
+   struct zink_context *ctx = zink_context(pctx);
    struct zink_transfer *trans = (struct zink_transfer *)ptrans;
+   if (ctx->flags & PIPE_CONTEXT_VIDEO) {
+      bool is_write = (ptrans->usage & PIPE_MAP_WRITE) > 0;
+      zink_screen_lock_context(screen);
+      zink_image_unmap(&screen->copy_context->base, ptrans);
+      if (is_write) {
+         zink_batch_sync_with_copy_context(ctx);
+         screen->copy_context->base.flush(&screen->copy_context->base, NULL, 0);
+      }
+      zink_screen_unlock_context(screen);
+      return;
+   }
    if (sizeof(void*) == 4)
       do_transfer_unmap(screen, trans);
    transfer_unmap(pctx, ptrans);
