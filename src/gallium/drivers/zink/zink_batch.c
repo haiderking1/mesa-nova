@@ -118,6 +118,7 @@ reset_batch_state_internal(struct zink_screen *screen, struct zink_batch_state *
    util_dynarray_clear(&bs->user_signal_semaphore_values);
 
    bs->present = VK_NULL_HANDLE;
+   bs->copy_context_semaphore = VK_NULL_HANDLE;
    /* check the arrays first to avoid locking unnecessarily */
    if (util_dynarray_contains(&bs->acquires, VkSemaphore) || util_dynarray_contains(&bs->tracked_semaphores, VkSemaphore)) {
       simple_mtx_lock(&screen->semaphores_lock);
@@ -829,8 +830,11 @@ submit_queue(void *data, void *gdata, int thread_index)
    set_foreach(&bs->exports, entry) {
       struct zink_resource *res = (void*)entry->key;
       if (res->obj->exportable_dmabuf) {
-         for (; res; res = zink_resource(res->base.b.next))
-            zink_screen_import_dmabuf_semaphore(screen, res, sem[i++]);
+         for (; res; res = zink_resource(res->base.b.next)) {
+            /* copy_context_semaphore is a special signal */
+            if (sem[i] != bs->copy_context_semaphore)
+               zink_screen_import_dmabuf_semaphore(screen, res, sem[i++]);
+         }
       }
 
       struct pipe_resource *pres = (void*)entry->key;
@@ -1245,4 +1249,18 @@ void
 zink_batch_usage_try_wait(struct zink_context *ctx, struct zink_batch_usage *u, unsigned submit_count)
 {
    batch_usage_wait(ctx, u, submit_count, true);
+}
+
+void
+zink_batch_sync_with_copy_context(struct zink_context *ctx)
+{
+   struct zink_screen *screen = zink_screen(ctx->base.screen);
+   screen->copy_context->bs->copy_context_semaphore = zink_create_semaphore(screen);
+   util_dynarray_append(&screen->copy_context->bs->signal_semaphores, screen->copy_context->bs->copy_context_semaphore);
+   VkPipelineStageFlags flag = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+   util_dynarray_append(&ctx->bs->wait_semaphores, screen->copy_context->bs->copy_context_semaphore);
+   util_dynarray_append(&ctx->bs->tracked_semaphores, screen->copy_context->bs->copy_context_semaphore);
+   util_dynarray_append(&ctx->bs->wait_semaphore_stages, flag);
+   uint64_t value = 0;
+   util_dynarray_append(&ctx->bs->wait_semaphore_values, value);
 }
