@@ -598,12 +598,32 @@ zink_clear_buffer(struct pipe_context *pctx,
 
 void
 zink_clear_render_target(struct pipe_context *pctx, struct pipe_surface *dst,
-                         const union pipe_color_union *color, unsigned dstx,
+                         const union pipe_color_union *pcolor, unsigned dstx,
                          unsigned dsty, unsigned width, unsigned height,
                          bool render_condition_enabled)
 {
    struct zink_context *ctx = zink_context(pctx);
-   struct pipe_resource *pres = dst->texture;
+   struct zink_resource *res = zink_resource(dst->texture);
+   if (width == 0 || height == 0)
+      return;
+   if (!res->obj->render_target) {
+      /* should only be hit by video */
+      if (dst->texture->bind & PIPE_BIND_SHADER_IMAGE) {
+         struct zink_screen *screen = zink_screen(pctx->screen);
+         /* this should always be a full clear */
+         assert(!dstx && !dsty);
+         VkClearColorValue color;
+         color.uint32[0] = pcolor->ui[0];
+         color.uint32[1] = pcolor->ui[1];
+         color.uint32[2] = pcolor->ui[2];
+         color.uint32[3] = pcolor->ui[3];
+         VkImageLayout layout = screen->driver_workarounds.general_layout ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+         VkImageSubresourceRange range = {res->aspect, dst->level, 1, dst->first_layer, dst->last_layer - dst->first_layer + 1};
+         zink_screen(ctx->base.screen)->image_barrier(ctx, res, layout, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+         VKCTX(CmdClearColorImage)(ctx->bs->cmdbuf, res->obj->image, res->layout, &color, 1, &range);
+      }
+      return;
+   }
    bool render_condition_active = ctx->render_condition_active;
    if (!render_condition_enabled && render_condition_active) {
       zink_stop_conditional_render(ctx);
@@ -612,9 +632,9 @@ zink_clear_render_target(struct pipe_context *pctx, struct pipe_surface *dst,
    util_blitter_save_framebuffer(ctx->blitter, &ctx->fb_state);
    set_clear_fb(pctx, dst, NULL);
    struct pipe_scissor_state scissor = {dstx, dsty, dstx + width, dsty + height};
-   zink_blit_barriers(ctx, NULL, zink_resource(pres), false);
+   zink_blit_barriers(ctx, NULL, res, false);
    ctx->blitting = true;
-   pctx->clear(pctx, PIPE_CLEAR_COLOR0, 0xf, 0, &scissor, color, 0, 0);
+   pctx->clear(pctx, PIPE_CLEAR_COLOR0, 0xf, 0, &scissor, pcolor, 0, 0);
    util_blitter_restore_fb_state(ctx->blitter);
    ctx->blitting = false;
    if (!render_condition_enabled && render_condition_active)
