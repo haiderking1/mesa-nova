@@ -109,7 +109,7 @@ nv_push_class_dump_h = custom_target(
 
 libnvidia_headers = static_library(
   'nvidia_headers_c',
-  ['nv_push.c', cl_generated, nv_push_class_dump_h],
+  ['nv_device_info.c', 'nv_push.c', cl_generated, nv_push_class_dump_h],
   include_directories : ['.', 'nvidia/classes', inc_include, inc_src],
   c_args : [no_override_init_args],
   gnu_symbol_visibility : 'hidden',
