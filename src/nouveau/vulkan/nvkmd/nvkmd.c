@@ -411,7 +411,6 @@ nvkmd_mem_map(struct nvkmd_mem *mem, struct vk_object_base *log_obj,
       simple_mtx_lock(&mem->map_mutex);
 
       assert((mem->map_cnt == 0) == (mem->map == NULL));
-      mem->map_cnt++;
 
       VkResult result = VK_SUCCESS;
       if (mem->map == NULL) {
@@ -425,6 +424,10 @@ nvkmd_mem_map(struct nvkmd_mem *mem, struct vk_object_base *log_obj,
       } else {
          map = mem->map;
       }
+
+      /* Only count the maps that succeeded, which are unmapped */
+      if (result == VK_SUCCESS)
+         mem->map_cnt++;
 
       simple_mtx_unlock(&mem->map_mutex);
 
