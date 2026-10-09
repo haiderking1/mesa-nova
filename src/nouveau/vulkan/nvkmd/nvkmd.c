@@ -5,6 +5,7 @@
 
 #include "nvkmd.h"
 #include "nouveau/nvkmd_nouveau.h"
+#include "nova/nvkmd_nova.h"
 #include "nv_push.h"
 #include "util/cache_ops.h"
 #include "util/u_math.h"
@@ -88,8 +89,13 @@ nvkmd_try_create_pdev_for_drm(struct _drmDevice *drm_device,
                               enum nvk_debug debug_flags,
                               struct nvkmd_pdev **pdev_out)
 {
-   return nvkmd_nouveau_try_create_pdev(drm_device, log_obj,
-                                        debug_flags, pdev_out);
+   VkResult result = nvkmd_nouveau_try_create_pdev(drm_device, log_obj,
+                                                   debug_flags, pdev_out);
+   if (result != VK_ERROR_INCOMPATIBLE_DRIVER)
+      return result;
+
+   return nvkmd_nova_try_create_pdev(drm_device, log_obj,
+                                     debug_flags, pdev_out);
 }
 
 VkResult MUST_CHECK

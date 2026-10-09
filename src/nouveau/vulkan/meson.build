@@ -98,6 +98,12 @@ nvk_files = files(
   'nvkmd/nouveau/nvkmd_nouveau_mem.c',
   'nvkmd/nouveau/nvkmd_nouveau_pdev.c',
   'nvkmd/nouveau/nvkmd_nouveau_va.c',
+  'nvkmd/nova/nvkmd_nova.h',
+  'nvkmd/nova/nvkmd_nova_ctx.c',
+  'nvkmd/nova/nvkmd_nova_dev.c',
+  'nvkmd/nova/nvkmd_nova_mem.c',
+  'nvkmd/nova/nvkmd_nova_pdev.c',
+  'nvkmd/nova/nvkmd_nova_va.c',
   'nvkmd/nvkmd.c',
   'nvkmd/nvkmd.h',
 )
