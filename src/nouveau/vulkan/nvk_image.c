@@ -403,6 +403,13 @@ nvk_GetPhysicalDeviceImageFormatProperties2(
    if (ycbcr_info && pImageFormatInfo->type != VK_IMAGE_TYPE_2D)
       return VK_ERROR_FORMAT_NOT_SUPPORTED;
 
+   /* Sparse images need the kernel to bind sparse virtual memory */
+   if ((pImageFormatInfo->flags & (VK_IMAGE_CREATE_SPARSE_BINDING_BIT |
+                                   VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT |
+                                   VK_IMAGE_CREATE_SPARSE_ALIASED_BIT)) &&
+       !pdev->nvkmd->kmd_info.has_sparse)
+      return VK_ERROR_FORMAT_NOT_SUPPORTED;
+
    /* Maxwell B and earlier don't support sparse residency */
    if ((pImageFormatInfo->flags & VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT) &&
        pdev->info.cls_eng3d < MAXWELL_B)
