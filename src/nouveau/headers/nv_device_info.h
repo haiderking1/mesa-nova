@@ -88,6 +88,21 @@ struct nv_device_info {
    bool has_zcull_info;
 };
 
+/* Returns the marketing name of the chip with PCI device ID `dev_id` on a board
+ * with the given PCI subsystem IDs, or NULL if unknown.
+ */
+const char *nv_device_name_for_chip(uint32_t dev_id,
+                                    uint16_t subsystem_id,
+                                    uint16_t subsystem_vendor_id);
+
+uint8_t nv_sm_for_chipset(uint16_t chipset);
+uint8_t nv_max_warps_per_mp_for_sm(uint8_t sm);
+uint8_t nv_max_blocks_per_mp_for_sm(uint8_t sm);
+uint8_t nv_mp_per_tpc_for_chipset(uint16_t chipset);
+
+/* Fills in the shared memory sizes of `info`, from its SM version. */
+void nv_device_info_init_shared_mem_sizes(struct nv_device_info *info);
+
 static inline void
 nv_device_uuid(const struct nv_device_info *info, uint8_t *uuid, size_t len, bool vm_bind)
 {
