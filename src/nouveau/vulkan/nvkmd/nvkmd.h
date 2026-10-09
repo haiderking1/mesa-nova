@@ -121,6 +121,9 @@ struct nvkmd_info {
    bool has_map_fixed;
    bool has_overmap;
    bool has_compression;
+
+   /** The kernel binds sparse virtual memory, for sparse resources */
+   bool has_sparse;
 };
 
 struct nvkmd_pdev_ops {
