@@ -344,9 +344,13 @@ nvk_get_device_extensions(const struct nvk_instance *instance,
 
 static void
 nvk_get_device_features(const struct nv_device_info *info,
+                        bool has_sparse,
                         const struct vk_device_extension_table *supported_extensions,
                         struct vk_features *features)
 {
+   /* Sparse resources need sparse virtual memory from the kernel. */
+   const bool sparse = has_sparse && info->cls_eng3d >= MAXWELL_B;
+
    /* TU11x uses the same shader model as other Turing but don't support the same features. */
    bool is_tu11x = info->chipset == 0x167 || info->chipset == 0x168;
 
@@ -396,14 +400,14 @@ nvk_get_device_features(const struct nv_device_info *info,
       .shaderInt16 = true,
       .shaderResourceResidency = info->cls_eng3d >= VOLTA_A,
       .shaderResourceMinLod = info->cls_eng3d >= VOLTA_A,
-      .sparseBinding = info->cls_eng3d >= MAXWELL_B,
-      .sparseResidency2Samples = info->cls_eng3d >= MAXWELL_B,
-      .sparseResidency4Samples = info->cls_eng3d >= MAXWELL_B,
-      .sparseResidency8Samples = info->cls_eng3d >= MAXWELL_B,
-      .sparseResidencyAliased = info->cls_eng3d >= MAXWELL_B,
-      .sparseResidencyBuffer = info->cls_eng3d >= MAXWELL_B,
-      .sparseResidencyImage2D = info->cls_eng3d >= MAXWELL_B,
-      .sparseResidencyImage3D = info->cls_eng3d >= MAXWELL_B,
+      .sparseBinding = sparse,
+      .sparseResidency2Samples = sparse,
+      .sparseResidency4Samples = sparse,
+      .sparseResidency8Samples = sparse,
+      .sparseResidencyAliased = sparse,
+      .sparseResidencyBuffer = sparse,
+      .sparseResidencyImage2D = sparse,
+      .sparseResidencyImage3D = sparse,
       .variableMultisampleRate = true,
       .inheritedQueries = true,
 
@@ -784,12 +788,12 @@ nvk_get_device_features(const struct nv_device_info *info,
       .shaderSharedFloat64AtomicAdd = true,
       .shaderImageFloat32Atomics = true,
       .shaderImageFloat32AtomicAdd = true,
-      .sparseImageFloat32Atomics = true,
-      .sparseImageFloat32AtomicAdd = true,
+      .sparseImageFloat32Atomics = has_sparse,
+      .sparseImageFloat32AtomicAdd = has_sparse,
 
       /* VK_EXT_shader_image_atomic_int64 */
       .shaderImageInt64Atomics = info->cls_eng3d >= KEPLER_B,
-      .sparseImageInt64Atomics = info->cls_eng3d >= MAXWELL_A,
+      .sparseImageInt64Atomics = has_sparse && info->cls_eng3d >= MAXWELL_A,
 
       /* VK_EXT_shader_module_identifier */
       .shaderModuleIdentifier = true,
@@ -1586,8 +1590,8 @@ nvk_create_drm_physical_device(struct vk_instance *_instance,
                              &supported_extensions);
 
    struct vk_features supported_features;
-   nvk_get_device_features(&nvkmd->dev_info, &supported_extensions,
-                           &supported_features);
+   nvk_get_device_features(&nvkmd->dev_info, nvkmd->kmd_info.has_sparse,
+                           &supported_extensions, &supported_features);
 
    struct vk_properties properties;
    nvk_get_device_properties(instance, &nvkmd->dev_info, &properties);
@@ -1713,24 +1717,28 @@ nvk_create_drm_physical_device(struct vk_instance *_instance,
    assert(pdev->mem_heap_count <= ARRAY_SIZE(pdev->mem_heaps));
    assert(pdev->mem_type_count <= ARRAY_SIZE(pdev->mem_types));
 
+   /* Binding sparse resources needs sparse virtual memory from the kernel. */
+   const VkQueueFlags sparse_binding =
+      nvkmd->kmd_info.has_sparse ? VK_QUEUE_SPARSE_BINDING_BIT : 0;
+
    pdev->queue_families[pdev->queue_family_count++] = (struct nvk_queue_family) {
       .queue_flags = VK_QUEUE_GRAPHICS_BIT |
                      VK_QUEUE_COMPUTE_BIT |
                      VK_QUEUE_TRANSFER_BIT |
-                     VK_QUEUE_SPARSE_BINDING_BIT,
+                     sparse_binding,
       .queue_count = 1,
    };
    if (pdev->info.has_transfer_queue) {
       pdev->queue_families[pdev->queue_family_count++] = (struct nvk_queue_family) {
          .queue_flags = VK_QUEUE_TRANSFER_BIT |
-                        VK_QUEUE_SPARSE_BINDING_BIT,
+                        sparse_binding,
          .queue_count = 2,
       };
    }
    if (nvk_video_enabled(instance, &pdev->info)) {
       pdev->queue_families[pdev->queue_family_count++] = (struct nvk_queue_family) {
          .queue_flags = VK_QUEUE_VIDEO_DECODE_BIT_KHR |
-                        VK_QUEUE_SPARSE_BINDING_BIT,
+                        sparse_binding,
          .queue_count = 1,
       };
    }
