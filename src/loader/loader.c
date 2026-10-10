@@ -208,6 +208,24 @@ nouveau_zink_predicate(int fd, const char *driver)
 #endif
 }
 
+/* nova has no GL driver of its own: GL runs on NVK through zink */
+bool
+nova_zink_predicate(int fd, const char *driver)
+{
+#ifndef HAVE_LIBDRM
+   return false;
+#else
+   drmVersionPtr version = drmGetVersion(fd);
+   if (!version)
+      return false;
+
+   const bool is_nova = !strcmp(version->name, "nova-drm");
+   drmFreeVersion(version);
+
+   return is_nova && !strcmp(driver, "zink");
+#endif
+}
+
 
 /**
  * Goes through all the platform devices whose driver is on the given list and
