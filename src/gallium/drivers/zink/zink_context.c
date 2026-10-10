@@ -5759,7 +5759,13 @@ zink_context_replace_buffer_storage(struct pipe_context *pctx, struct pipe_resou
    zink_batch_reference_resource(ctx, d);
    /* don't be too creative */
    zink_resource_object_reference(screen, &d->obj, s->obj);
-   d->valid_buffer_range = s->valid_buffer_range;
+   /* Copy the range, not its lock: another context may hold the lock of the
+    * source, which the destination would then keep locked forever.
+    */
+   simple_mtx_lock(&s->valid_buffer_range.write_mutex);
+   d->valid_buffer_range.start = s->valid_buffer_range.start;
+   d->valid_buffer_range.end = s->valid_buffer_range.end;
+   simple_mtx_unlock(&s->valid_buffer_range.write_mutex);
    s->real_buffer_range = &d->valid_buffer_range;
    zink_resource_copies_reset(d);
    /* force counter buffer reset */
