@@ -5009,6 +5009,18 @@ rebind_buffer(struct zink_context *ctx, struct zink_resource *res, uint64_t rebi
    unsigned num_rebinds = 0;
    bool has_write = false;
 
+   /* Vertex buffers passed with draws aren't counted in the binds of their resources: a draw
+    * without vertex buffers must still bind the new storage.
+    */
+   if (ctx->vertex_buffers_unowned) {
+      for (unsigned i = 0; i < ctx->vertex_buffers_count; i++) {
+         if (ctx->vertex_buffers[i].buffer.resource == &res->base.b) {
+            ctx->vertex_buffers_dirty = true;
+            break;
+         }
+      }
+   }
+
    if (!zink_resource_has_binds(res))
       return 0;
 
