@@ -775,8 +775,11 @@ zink_draw(struct pipe_context *pctx,
       ctx->line_width_changed = false;
    }
 
-   if (!DRAW_STATE) {
-      if (BATCH_CHANGED || ctx->vertex_buffers_dirty)
+   /* vertex buffers passed with the draw too: beginning the renderpass may have run a blit
+    * (e.g. filling an msrtss-emulated attachment), which binds its own vertex state
+    */
+   if (!DRAW_STATE || !vstate) {
+      if (BATCH_CHANGED || ctx->vertex_buffers_dirty || DRAW_STATE)
          bind_vertex_buffers<DYNAMIC_STATE>(ctx, ctx->vertex_buffers);
       if ((DYNAMIC_STATE == ZINK_DYNAMIC_VERTEX_INPUT2 || DYNAMIC_STATE == ZINK_DYNAMIC_VERTEX_INPUT) && (BATCH_CHANGED || ctx->vertex_state_changed))
          VKCTX(CmdSetVertexInputEXT)(ctx->bs->cmdbuf,
@@ -1199,14 +1202,7 @@ zink_draw_vbo_buffers(struct pipe_context *pctx,
    if (ctx->in_rp)
       ctx->can_promote_depth_op = false;
 
-   bind_vertex_buffers<DYNAMIC_STATE>(ctx, buffers);
-
-   if ((DYNAMIC_STATE == ZINK_DYNAMIC_VERTEX_INPUT2 || DYNAMIC_STATE == ZINK_DYNAMIC_VERTEX_INPUT) && (BATCH_CHANGED || ctx->vertex_state_changed))
-      VKCTX(CmdSetVertexInputEXT)(ctx->bs->cmdbuf,
-                                    ctx->element_state->hw_state.num_bindings, ctx->element_state->hw_state.dynbindings,
-                                    ctx->element_state->hw_state.num_attribs, ctx->element_state->hw_state.dynattribs);
-   ctx->vertex_state_changed = false;
-
+   /* zink_draw binds the buffers (recorded in ctx->vertex_buffers) once the renderpass has begun */
    zink_draw<HAS_MULTIDRAW, DYNAMIC_STATE, BATCH_CHANGED, true>(pctx, dinfo, 0, NULL, draws, num_draws, NULL, 0);
 }
 
