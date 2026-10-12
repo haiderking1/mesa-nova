@@ -1923,6 +1923,13 @@ struct pipe_vp9_picture_desc
       uint8_t abs_delta;
       int8_t ref_deltas[4];
       int8_t mode_deltas[2];
+      /* Which of ref_deltas and mode_deltas the frame header updates. */
+      uint8_t update_ref_delta;
+      uint8_t update_mode_delta;
+
+      uint8_t refresh_frame_flags;
+      uint8_t color_space;
+      bool color_range;
    } picture_parameter;
 
    struct {
