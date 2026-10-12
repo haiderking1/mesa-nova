@@ -2,17 +2,100 @@
 // SPDX-License-Identifier: MIT
 
 use crate::ffi;
+use crate::ffi::{nvk_cmd_buffer, nvk_image, nvk_image_view, VK_SUCCESS};
 use nv_push_rs;
 use nvidia_headers::classes::cl906f::mthd as cl906f;
 use nvidia_headers::Mthd;
 
 mod h264;
+mod vp9;
+mod vp9_default_probs;
+
+/// Suballocate `size` upload-heap bytes (256-byte aligned) and, if `data` is
+/// given, copy it in. Returns the GPU address of the allocation.
+unsafe fn upload_bytes(
+    cmd: &mut nvk_cmd_buffer,
+    data: Option<(*const u8, usize)>,
+    size: u32,
+) -> Result<u64, ffi::VkResult> {
+    let mut ptr = std::ptr::null_mut();
+    let mut addr = 0;
+    unsafe {
+        let res = ffi::nvk_cmd_buffer_upload_alloc(
+            cmd,
+            size,
+            256,
+            &mut addr,
+            &mut ptr as *mut *mut _ as *mut *mut std::ffi::c_void,
+        );
+        if res != VK_SUCCESS {
+            return Err(res);
+        }
+        if let Some((src, len)) = data {
+            std::ptr::copy_nonoverlapping(src, ptr as *mut u8, len);
+        }
+    }
+    Ok(addr)
+}
+
+/// Identifies a DPB picture.
+///
+/// With "separated" DPB each picture has its own image view (always array layer
+/// 0); with "layered" DPB a single array image view backs every picture and the
+/// array layer selects the picture. Keying on the image view alone therefore
+/// collides in the layered case, so the array layer is part of the key. Two
+/// video picture resources only match if they refer to the same image
+/// subresource *and* specify the same coded offset and extent, so those are
+/// part of the key as well.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+struct SlotKey {
+    image_view: *const nvk_image_view,
+    layer: u32,
+    coded_offset: (i32, i32),
+    coded_extent: (u32, u32),
+}
+
+/// Build the [`SlotKey`] for a Vulkan picture resource.
+fn slot_key(res: &ffi::VkVideoPictureResourceInfoKHR) -> SlotKey {
+    let image_view =
+        unsafe { ffi::nvk_image_view_from_handle(res.imageViewBinding) };
+    SlotKey {
+        image_view,
+        layer: unsafe { (*image_view).vk.base_array_layer }
+            + res.baseArrayLayer,
+        coded_offset: (res.codedOffset.x, res.codedOffset.y),
+        coded_extent: (res.codedExtent.width, res.codedExtent.height),
+    }
+}
+
+/// A GPU address in the form the engine's offset methods take: shifted right
+/// by 8, so the low 8 bits have to be zero for the address to survive the
+/// round trip.
+fn addr_hi(addr: u64) -> u32 {
+    assert!(addr & 0xff == 0, "address {addr:#x} is not 256B aligned");
+    (addr >> 8).try_into().unwrap()
+}
+
+/// Address (already shifted right by 8, as the hardware expects) of the given
+/// plane and DPB array layer of an image. For "separated" DPB the layer is 0
+/// and this is just the plane base address; for "layered" DPB the layer selects
+/// the picture within the array image.
+fn plane_layer_base(img: *mut nvk_image, plane: u8, layer: u32) -> u32 {
+    let base = unsafe { ffi::nvk_image_base_address(img, plane) };
+    let array_stride =
+        unsafe { (*img).planes[plane as usize].nil.array_stride_B };
+    addr_hi(base + u64::from(layer) * array_stride)
+}
 
 struct SessionData {
     decoder: Box<dyn VideoDecoder>,
 }
 
 pub(crate) trait VideoDecoder {
+    /// Forgets what the session decoded: the next frame is decoded as the
+    /// first one (`VK_VIDEO_CODING_CONTROL_RESET_BIT_KHR`).
+    fn reset(&mut self, _cmd: &mut ffi::nvk_cmd_buffer) {}
+
     fn begin(
         &mut self,
         _cmd: &mut ffi::nvk_cmd_buffer,
@@ -31,10 +114,13 @@ pub(crate) trait VideoDecoder {
 pub extern "C" fn nvk_video_create_video_session(
     vid: &mut ffi::nvk_video_session,
 ) {
-    vid.rust = Box::into_raw(Box::new(SessionData {
-        decoder: Box::new(h264::Decoder::default()),
-    }))
-    .cast();
+    let decoder: Box<dyn VideoDecoder> = match vid.vk.op {
+        ffi::VK_VIDEO_CODEC_OPERATION_DECODE_VP9_BIT_KHR => {
+            Box::new(vp9::Decoder::default())
+        }
+        _ => Box::new(h264::Decoder::default()),
+    };
+    vid.rust = Box::into_raw(Box::new(SessionData { decoder })).cast();
 }
 
 #[unsafe(no_mangle)]
@@ -120,4 +206,14 @@ pub extern "C" fn nvk_video_cmd_decode_video_khr(
         .decode(cmd, &frame_info)
         .err()
         .unwrap_or(ffi::VK_SUCCESS)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nvk_video_cmd_control_video_coding_khr(
+    cmd: &mut ffi::nvk_cmd_buffer,
+    control_info: &ffi::VkVideoCodingControlInfoKHR,
+) {
+    if control_info.flags & ffi::VK_VIDEO_CODING_CONTROL_RESET_BIT_KHR != 0 {
+        to_session(cmd).decoder.reset(cmd);
+    }
 }

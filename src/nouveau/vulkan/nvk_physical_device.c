@@ -114,11 +114,12 @@ nvk_get_device_extensions(const struct nvk_instance *instance,
                           bool has_tiled_bos,
                           struct vk_device_extension_table *ext)
 {
-   const bool h264dec = nvk_video_enabled(instance, info);
+   const bool h264dec = nvk_video_h264_enabled(instance, info);
+   const bool vp9dec = nvk_video_vp9_enabled(instance, info);
    /* The queue and the maintenance extensions are not codec specific, so
-    * they follow whether any decode codec is built.
+    * they follow whether any decode codec is enabled.
     */
-   const bool video = h264dec;
+   const bool video = h264dec || vp9dec;
 
    *ext = (struct vk_device_extension_table) {
       .KHR_8bit_storage = true,
@@ -223,6 +224,7 @@ nvk_get_device_extensions(const struct nvk_instance *instance,
       .KHR_video_queue = video,
       .KHR_video_decode_queue = video,
       .KHR_video_decode_h264 = h264dec,
+      .KHR_video_decode_vp9 = vp9dec,
       .KHR_video_maintenance1 = video,
       .KHR_video_maintenance2 = video,
       .KHR_vulkan_memory_model = info->cls_eng3d >= MAXWELL_A,
@@ -593,6 +595,9 @@ nvk_get_device_features(const struct nv_device_info *info,
 
       /* VK_KHR_video_maintenance2 */
       .videoMaintenance2 = true,
+
+      /* VK_KHR_video_decode_vp9 */
+      .videoDecodeVP9 = supported_extensions->KHR_video_decode_vp9,
 
       /* VK_KHR_workgroup_memory_explicit_layout */
       .workgroupMemoryExplicitLayout = true,
@@ -1915,10 +1920,15 @@ nvk_GetPhysicalDeviceQueueFamilyProperties2(
 
             case VK_STRUCTURE_TYPE_QUEUE_FAMILY_VIDEO_PROPERTIES_KHR: {
                VkQueueFamilyVideoPropertiesKHR *p = (void *)ext;
-               if (queue_family->queue_flags & VK_QUEUE_VIDEO_DECODE_BIT_KHR &&
-                   VIDEO_CODEC_H264DEC)
-                  p->videoCodecOperations =
+               p->videoCodecOperations = 0;
+               if (!(queue_family->queue_flags & VK_QUEUE_VIDEO_DECODE_BIT_KHR))
+                  break;
+               if (pdev->vk.supported_extensions.KHR_video_decode_h264)
+                  p->videoCodecOperations |=
                      VK_VIDEO_CODEC_OPERATION_DECODE_H264_BIT_KHR;
+               if (pdev->vk.supported_extensions.KHR_video_decode_vp9)
+                  p->videoCodecOperations |=
+                     VK_VIDEO_CODEC_OPERATION_DECODE_VP9_BIT_KHR;
                break;
             }
 

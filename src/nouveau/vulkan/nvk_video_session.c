@@ -11,6 +11,7 @@
 #include "nvk_rust.h"
 #include "nvk_entrypoints.h"
 
+
 VKAPI_ATTR VkResult VKAPI_CALL
 nvk_CreateVideoSessionKHR(VkDevice _device,
                           const VkVideoSessionCreateInfoKHR *pCreateInfo,
@@ -52,6 +53,33 @@ nvk_CreateVideoSessionKHR(VkDevice _device,
       vid->mems[2] = (struct nvk_vid_mem) {
          .size_B = history_size,
          .align_B = 256,
+      };
+      break;
+   }
+
+   case VK_VIDEO_CODEC_OPERATION_DECODE_VP9_BIT_KHR: {
+      /* Sizes in 64x64 superblocks, as the decoder needs for the largest
+       * picture, matching what NVIDIA's driver asks for.
+       */
+      uint64_t sb_cols = DIV_ROUND_UP(vid->vk.max_coded.width, 64);
+      uint64_t sb_rows = DIV_ROUND_UP(vid->vk.max_coded.height, 64);
+      uint64_t sbs = sb_cols * sb_rows;
+      /* Tile columns are at least 4 superblocks wide. */
+      uint64_t tile_cols = DIV_ROUND_UP(sb_cols, 4);
+
+      vid->mems[NVK_VP9_MEM_SEG_MV] = (struct nvk_vid_mem) {
+         .size_B = align64(2 * NVK_VP9_SEG_MAP_SB_B * sbs +
+                           2 * NVK_VP9_COL_MV_SB_B * sbs, 4096),
+         .align_B = 4096,
+      };
+      vid->mems[NVK_VP9_MEM_FILTER] = (struct nvk_vid_mem) {
+         .size_B = align64(NVK_VP9_INTRA_TOP_B + 5776 * sb_cols +
+                           3328 * MAX2(tile_cols - 1, 1) * sb_rows, 4096),
+         .align_B = 4096,
+      };
+      vid->mems[NVK_VP9_MEM_PROBS] = (struct nvk_vid_mem) {
+         .size_B = NVK_VP9_PROBS_MEM_B,
+         .align_B = 4096,
       };
       break;
    }
@@ -114,12 +142,39 @@ nvk_GetVideoSessionMemoryRequirementsKHR(VkDevice _device,
    return vk_outarray_status(&out);
 }
 
+/* Gives the probability tables of a VP9 session their default probabilities,
+ * and clears the symbol counters and the decoder's state of the previous
+ * picture, through the upload queue, which the decodes submitted later wait
+ * for. The decoder adapts the 4 frame contexts from then on, and resets them
+ * from the defaults on key frames and as frames ask.
+ */
+static VkResult
+nvk_video_vp9_init_probs_mem(struct nvk_device *dev,
+                             const struct nvk_video_session *vid)
+{
+   uint8_t *data = vk_zalloc(&dev->vk.alloc, NVK_VP9_PROBS_MEM_B, 8,
+                             VK_SYSTEM_ALLOCATION_SCOPE_COMMAND);
+   if (data == NULL)
+      return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+
+   for (unsigned i = 0; i <= NVK_VP9_DEFAULT_PROBS; i++)
+      nvk_video_vp9_default_probs(data + i * NVK_VP9_PROBS_B, NVK_VP9_PROBS_B);
+
+   VkResult result = nvk_upload_queue_upload(dev, &dev->upload,
+                                             vid->mems[NVK_VP9_MEM_PROBS].addr,
+                                             data, NVK_VP9_PROBS_MEM_B);
+   vk_free(&dev->vk.alloc, data);
+
+   return result;
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 nvk_BindVideoSessionMemoryKHR(VkDevice _device,
    VkVideoSessionKHR videoSession,
    uint32_t videoSessionBindMemoryCount,
    const VkBindVideoSessionMemoryInfoKHR *pBindSessionMemoryInfos)
 {
+   VK_FROM_HANDLE(nvk_device, dev, _device);
    VK_FROM_HANDLE(nvk_video_session, vid, videoSession);
 
    for (unsigned i = 0; i < videoSessionBindMemoryCount; i++) {
@@ -128,6 +183,13 @@ nvk_BindVideoSessionMemoryKHR(VkDevice _device,
 
       vid->mems[info->memoryBindIndex].addr =
          mem->mem->va->addr + info->memoryOffset;
+
+      if (vid->vk.op == VK_VIDEO_CODEC_OPERATION_DECODE_VP9_BIT_KHR &&
+          info->memoryBindIndex == NVK_VP9_MEM_PROBS) {
+         VkResult result = nvk_video_vp9_init_probs_mem(dev, vid);
+         if (result != VK_SUCCESS)
+            return result;
+      }
    }
    return VK_SUCCESS;
 }
@@ -140,12 +202,6 @@ nvk_GetPhysicalDeviceVideoCapabilitiesKHR(VkPhysicalDevice physicalDevice,
    pCapabilities->flags = 0;
    pCapabilities->minBitstreamBufferOffsetAlignment = 256;
    pCapabilities->minBitstreamBufferSizeAlignment = 256;
-   pCapabilities->pictureAccessGranularity.width = VK_VIDEO_H264_MACROBLOCK_WIDTH;
-   pCapabilities->pictureAccessGranularity.height = VK_VIDEO_H264_MACROBLOCK_HEIGHT;
-   pCapabilities->minCodedExtent.width = 48;
-   pCapabilities->minCodedExtent.height = VK_VIDEO_H264_MACROBLOCK_HEIGHT;
-   pCapabilities->maxCodedExtent.width = 4096;
-   pCapabilities->maxCodedExtent.height = 4096;
 
    struct VkVideoDecodeCapabilitiesKHR *dec_caps =
       vk_find_struct(pCapabilities->pNext, VIDEO_DECODE_CAPABILITIES_KHR);
@@ -176,6 +232,12 @@ nvk_GetPhysicalDeviceVideoCapabilitiesKHR(VkPhysicalDevice physicalDevice,
       if (pVideoProfile->lumaBitDepth != VK_VIDEO_COMPONENT_BIT_DEPTH_8_BIT_KHR)
          return VK_ERROR_VIDEO_PROFILE_FORMAT_NOT_SUPPORTED_KHR;
 
+      pCapabilities->pictureAccessGranularity.width = VK_VIDEO_H264_MACROBLOCK_WIDTH;
+      pCapabilities->pictureAccessGranularity.height = VK_VIDEO_H264_MACROBLOCK_HEIGHT;
+      pCapabilities->minCodedExtent.width = 48;
+      pCapabilities->minCodedExtent.height = VK_VIDEO_H264_MACROBLOCK_HEIGHT;
+      pCapabilities->maxCodedExtent.width = 4096;
+      pCapabilities->maxCodedExtent.height = 4096;
       pCapabilities->flags = VK_VIDEO_CAPABILITY_SEPARATE_REFERENCE_IMAGES_BIT_KHR;
       pCapabilities->maxDpbSlots = 17;
       pCapabilities->maxActiveReferencePictures = 16;
@@ -186,6 +248,47 @@ nvk_GetPhysicalDeviceVideoCapabilitiesKHR(VkPhysicalDevice physicalDevice,
              VK_STD_VULKAN_VIDEO_CODEC_H264_DECODE_EXTENSION_NAME);
       pCapabilities->stdHeaderVersion.specVersion =
          VK_STD_VULKAN_VIDEO_CODEC_H264_DECODE_SPEC_VERSION;
+      break;
+   }
+
+   case VK_VIDEO_CODEC_OPERATION_DECODE_VP9_BIT_KHR: {
+      VK_FROM_HANDLE(nvk_physical_device, pdev, physicalDevice);
+      const struct VkVideoDecodeVP9ProfileInfoKHR *vp9_profile =
+         vk_find_struct_const(pVideoProfile->pNext,
+                              VIDEO_DECODE_VP9_PROFILE_INFO_KHR);
+      struct VkVideoDecodeVP9CapabilitiesKHR *ext =
+         vk_find_struct(pCapabilities->pNext,
+                        VIDEO_DECODE_VP9_CAPABILITIES_KHR);
+
+      if (!pdev->vk.supported_extensions.KHR_video_decode_vp9)
+         return VK_ERROR_VIDEO_PROFILE_CODEC_NOT_SUPPORTED_KHR;
+
+      /* Profile 0: 8-bit 4:2:0. */
+      if (vp9_profile->stdProfile != STD_VIDEO_VP9_PROFILE_0)
+         return VK_ERROR_VIDEO_PROFILE_OPERATION_NOT_SUPPORTED_KHR;
+
+      if (pVideoProfile->lumaBitDepth != VK_VIDEO_COMPONENT_BIT_DEPTH_8_BIT_KHR)
+         return VK_ERROR_VIDEO_PROFILE_FORMAT_NOT_SUPPORTED_KHR;
+
+      /* The limits NVIDIA's driver reports for NVDEC on Ampere. */
+      pCapabilities->pictureAccessGranularity.width = 16;
+      pCapabilities->pictureAccessGranularity.height = 16;
+      pCapabilities->minCodedExtent.width = 128;
+      pCapabilities->minCodedExtent.height = 128;
+      pCapabilities->maxCodedExtent.width = 8192;
+      pCapabilities->maxCodedExtent.height = 8192;
+      pCapabilities->flags = VK_VIDEO_CAPABILITY_SEPARATE_REFERENCE_IMAGES_BIT_KHR;
+      /* The 8 reference frames, and the picture decoded, which is also its
+       * own reconstructed picture.
+       */
+      pCapabilities->maxDpbSlots = STD_VIDEO_VP9_NUM_REF_FRAMES + 1;
+      pCapabilities->maxActiveReferencePictures =
+         VK_MAX_VIDEO_VP9_REFERENCES_PER_FRAME_KHR;
+      ext->maxLevel = STD_VIDEO_VP9_LEVEL_6_2;
+      strcpy(pCapabilities->stdHeaderVersion.extensionName,
+             VK_STD_VULKAN_VIDEO_CODEC_VP9_DECODE_EXTENSION_NAME);
+      pCapabilities->stdHeaderVersion.specVersion =
+         VK_STD_VULKAN_VIDEO_CODEC_VP9_DECODE_SPEC_VERSION;
       break;
    }
 

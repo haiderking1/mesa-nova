@@ -201,6 +201,7 @@ nvk_bindings_rs_gen = rust.bindgen(
     '--allowlist-function', '.*vk_find.*|.*vk_video.*|nvk.*',
     '--allowlist-function', 'vk_buffer_address',
     '--allowlist-var', '.*SUBC.*',
+    '--allowlist-var', 'NVK_VP9_.*',
   ],
   include_directories : include_directories('.'),
   dependencies : nvk_deps,

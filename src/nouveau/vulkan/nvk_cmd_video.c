@@ -34,6 +34,9 @@ VKAPI_ATTR void VKAPI_CALL
 nvk_CmdControlVideoCodingKHR(VkCommandBuffer commandBuffer,
                              const VkVideoCodingControlInfoKHR *pCodingControlInfo)
 {
+   VK_FROM_HANDLE(nvk_cmd_buffer, cmd, commandBuffer);
+
+   nvk_video_cmd_control_video_coding_khr(cmd, pCodingControlInfo);
 }
 
 VKAPI_ATTR void VKAPI_CALL
