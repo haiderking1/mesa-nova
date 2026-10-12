@@ -41,7 +41,8 @@ add_sync(struct nvkmd_ctx *ctx, struct vk_object_base *log_obj,
 }
 
 /* Returns the channel to create for `engines`: on the graphics engine with
- * the classes they need, a copy object coming with it, or on a copy engine.
+ * the classes they need, a copy object coming with it, on a copy engine, or
+ * on a video decoder engine, which runs nothing else.
  */
 static VkResult
 channel_for_engines(enum nvkmd_engines engines,
@@ -50,6 +51,13 @@ channel_for_engines(enum nvkmd_engines engines,
    const enum nvkmd_engines graphics =
       NVKMD_ENGINE_3D | NVKMD_ENGINE_COMPUTE |
       NVKMD_ENGINE_2D | NVKMD_ENGINE_M2MF;
+
+   if (engines == NVKMD_ENGINE_VDEC) {
+      *create = (struct drm_nova_channel_create) {
+         .engine = DRM_NOVA_ENGINE_VIDEO_DECODER,
+      };
+      return VK_SUCCESS;
+   }
 
    if (engines & ~(graphics | NVKMD_ENGINE_COPY))
       return VK_ERROR_FEATURE_NOT_PRESENT;
