@@ -65,11 +65,13 @@ struct zink_video_surf_data {
 
 struct zink_video_profile {
    VkVideoDecodeH264ProfileInfoKHR h264;
+   VkVideoDecodeVP9ProfileInfoKHR vp9;
    VkVideoProfileInfoKHR profile;
 };
 
 struct zink_video_profile_info {
    struct zink_video_profile h264;
+   struct zink_video_profile vp9;
    VkVideoProfileInfoKHR profiles[4];
    VkVideoProfileListInfoKHR list;
 };
@@ -83,6 +85,7 @@ struct zink_video_caps_info {
    VkVideoCapabilitiesKHR caps;
    VkVideoDecodeCapabilitiesKHR dec_caps;
    VkVideoDecodeH264CapabilitiesKHR h264_dec_caps;
+   VkVideoDecodeVP9CapabilitiesKHR vp9_dec_caps;
 };
 
 bool
