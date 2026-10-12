@@ -862,7 +862,10 @@ submit_queue(void *data, void *gdata, int thread_index)
    VkSemaphore *sem = bs->signal_semaphores.data;
    set_foreach(&bs->exports, entry) {
       struct zink_resource *res = (void*)entry->key;
-      if (res->obj->exportable_dmabuf) {
+      /* The semaphores of a failed submission have no signal operation
+       * pending, which exporting them as sync files would wait for forever.
+       */
+      if (res->obj->exportable_dmabuf && !bs->is_device_lost) {
          for (; res; res = zink_resource(res->base.b.next))
             zink_screen_import_dmabuf_semaphore(screen, res, sem[i++]);
       }
