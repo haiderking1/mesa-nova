@@ -67,9 +67,13 @@ nvk_CreateVideoSessionKHR(VkDevice _device,
       /* Tile columns are at least 4 superblocks wide. */
       uint64_t tile_cols = DIV_ROUND_UP(sb_cols, 4);
 
+      /* Two of each, the decoder writing one as it reads the other. */
+      const uint64_t seg_map_B =
+         align64(NVK_VP9_SEG_MAP_SB_B * sbs, NVK_VP9_BUF_ALIGN_B);
+      const uint64_t col_mv_B =
+         align64(NVK_VP9_COL_MV_SB_B * sbs, NVK_VP9_BUF_ALIGN_B);
       vid->mems[NVK_VP9_MEM_SEG_MV] = (struct nvk_vid_mem) {
-         .size_B = align64(2 * NVK_VP9_SEG_MAP_SB_B * sbs +
-                           2 * NVK_VP9_COL_MV_SB_B * sbs, 4096),
+         .size_B = align64(2 * seg_map_B + 2 * col_mv_B, 4096),
          .align_B = 4096,
       };
       vid->mems[NVK_VP9_MEM_FILTER] = (struct nvk_vid_mem) {
