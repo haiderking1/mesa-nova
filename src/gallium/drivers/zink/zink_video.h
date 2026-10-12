@@ -38,10 +38,16 @@
 struct zink_video_codec {
    struct pipe_video_codec base;
    struct pipe_screen *screen;
-   void *bs_ptr;
+   /* The bitstream of the frame, gathered as it comes, then uploaded to
+    * bitstream_res at bs_offset, bs_range bytes with the padding.
+    */
+   uint8_t *bs_data;
+   size_t bs_capacity;
    size_t bs_size;
    struct u_upload_mgr *bitstream_mgr;
    struct zink_resource *bitstream_res;
+   unsigned bs_offset;
+   size_t bs_range;
    VkVideoSessionParametersKHR params;
    unsigned num_priv_mems;
    unsigned max_dpb_slots;
@@ -51,6 +57,7 @@ struct zink_video_codec {
    bool coincide_dpb;
    bool dpb_array;
    size_t srcbuf_align;
+   size_t srcbuf_offset_align;
    void *render_pic_list[17];
    /* for separate dpb/dst storage */
    struct pipe_resource *dpb_res[17];
