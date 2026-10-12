@@ -55,6 +55,38 @@ enum nvk_vp9_mem {
 #define NVK_VP9_PREV_PIC_OFFSET_B (NVK_VP9_COUNTERS_OFFSET_B + NVK_VP9_COUNTERS_B)
 #define NVK_VP9_PROBS_MEM_B (NVK_VP9_PREV_PIC_OFFSET_B + NVK_VP9_PREV_PIC_B)
 
+/* The memory of AV1 sessions, by binding.
+ *
+ * NVK_AV1_MEM_MV_SEG: for each DPB slot, and a scratch slot for frames which
+ * aren't references, the temporal motion vectors and the segment ids of the
+ * frame decoded to it; then a segment id map of zeros, which frames read when
+ * the frame they predict the segment ids from had segmentation disabled.
+ *
+ * NVK_AV1_MEM_FILTER: the loop filter, CDEF, loop restoration, superres and
+ * film grain buffers, then the intra prediction top line.
+ *
+ * NVK_AV1_MEM_PROBS: the probability tables: the default ones of the 4
+ * quantizer contexts, then the pool frames save theirs to.
+ *
+ * The sizes depend on the largest picture, see nvk_video_av1_mem_layout().
+ */
+enum nvk_av1_mem {
+   NVK_AV1_MEM_MV_SEG,
+   NVK_AV1_MEM_FILTER,
+   NVK_AV1_MEM_PROBS,
+};
+
+/* Bytes of an AV1 probability table, 256-byte aligned. */
+#define NVK_AV1_PROBS_B 0x3000
+/* The default probability tables, one per quantizer context. */
+#define NVK_AV1_DEFAULT_PROBS 4
+/* The probability tables frames save theirs to: one for each frame the 9 DPB
+ * slots may hold, and one for the frame decoded.
+ */
+#define NVK_AV1_PROBS_POOL 10
+#define NVK_AV1_PROBS_MEM_B \
+   ((NVK_AV1_DEFAULT_PROBS + NVK_AV1_PROBS_POOL) * NVK_AV1_PROBS_B)
+
 struct nvk_vid_mem {
    uint64_t size_B;
    uint32_t align_B;
