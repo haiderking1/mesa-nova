@@ -29,6 +29,9 @@ enum nvk_vp9_mem {
    NVK_VP9_MEM_PROBS,
 };
 
+/* The decoder takes the addresses of its buffers in units of 256 bytes. */
+#define NVK_VP9_BUF_ALIGN_B 256
+
 /* Bytes per 64x64 superblock of a segmentation map. */
 #define NVK_VP9_SEG_MAP_SB_B 32
 /* Bytes per 64x64 superblock of co-located motion vectors. */
