@@ -4,7 +4,6 @@
 use crate::ffi;
 use nv_push_rs;
 use nvidia_headers::classes::cl906f::mthd as cl906f;
-use nvidia_headers::classes::clc5b0::NVC5B0_VIDEO_DECODER;
 use nvidia_headers::Mthd;
 
 mod h264;
@@ -72,15 +71,18 @@ fn to_session<'a>(cmd_buf: *mut ffi::nvk_cmd_buffer) -> &'a mut SessionData {
 pub extern "C" fn nvk_push_video_decode_state_init(
     _queue: &mut ffi::nvk_queue,
     p: *mut ffi::nv_push,
+    cls_vdec: u16,
 ) -> ffi::VkResult {
     let mut push = nv_push_rs::Push::new();
 
+    // The decoder object is of the device's video decoder class, not
+    // Turing's: the methods are handled by the rules of the class bound here.
     let set_object = cl906f::SetObject {
-        nvclass: NVC5B0_VIDEO_DECODER.into(),
+        nvclass: cls_vdec.into(),
         engine: cl906f::SetObjectEngine::Sw,
     };
     push.push_mthd_bits(
-        nv_push_rs::class_to_subc(NVC5B0_VIDEO_DECODER),
+        nv_push_rs::class_to_subc(cls_vdec),
         cl906f::SetObject::ADDR,
         set_object.to_bits(),
     );
