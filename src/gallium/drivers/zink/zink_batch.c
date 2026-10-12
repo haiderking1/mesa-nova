@@ -864,11 +864,14 @@ submit_queue(void *data, void *gdata, int thread_index)
    VkSemaphore *sem = bs->signal_semaphores.data;
    set_foreach(&bs->exports, entry) {
       struct zink_resource *res = (void*)entry->key;
+      /* The semaphores of a failed submission have no signal operation
+       * pending, which exporting them as sync files would wait for forever.
+       */
       /* Add the batch's fence as a write fence only if the batch wrote the
        * resource; otherwise add it as a read fence, which only later writers
        * wait on.
        */
-      if (res->obj->exportable_dmabuf) {
+      if (res->obj->exportable_dmabuf && !bs->is_device_lost) {
          for (; res; res = zink_resource(res->base.b.next)) {
             bool write = zink_batch_usage_matches(res->obj->bo->writes.u, bs);
             zink_screen_import_dmabuf_semaphore(screen, res, sem[i++], write);
