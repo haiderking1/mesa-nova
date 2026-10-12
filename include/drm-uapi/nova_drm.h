@@ -465,6 +465,32 @@ struct drm_nova_info_timestamp {
 };
 
 /**
+ * DRM_NOVA_INFO_VIDEO_DECODER
+ *
+ * Query the class of the objects of the video decoder engines (NVDEC) that
+ * userspace builds work for. The result is returned in a
+ * &struct drm_nova_info_video_decoder.
+ *
+ * Fails with -ENODEV if the GPU has no video decoder engine.
+ */
+#define DRM_NOVA_INFO_VIDEO_DECODER	0x05
+
+/**
+ * struct drm_nova_info_video_decoder - video decoder engine information
+ */
+struct drm_nova_info_video_decoder {
+	/**
+	 * @class_video_decoder: Class of the video decoder objects.
+	 */
+	__u32 class_video_decoder;
+
+	/**
+	 * @pad: 32 bit padding, 0.
+	 */
+	__u32 pad;
+};
+
+/**
  * DRM_NOVA_ENGINE_GRAPHICS - the graphics engine
  *
  * Its channels have objects of the classes &struct drm_nova_channel_create
@@ -481,6 +507,15 @@ struct drm_nova_info_timestamp {
  * subchannel itself.
  */
 #define DRM_NOVA_ENGINE_COPY		0x2
+
+/**
+ * DRM_NOVA_ENGINE_VIDEO_DECODER - a video decoder engine (NVDEC)
+ *
+ * Its channels have an object of the video decoder class
+ * (&struct drm_nova_info_video_decoder), which userspace binds to a subchannel
+ * itself.
+ */
+#define DRM_NOVA_ENGINE_VIDEO_DECODER	0x3
 
 /*
  * The classes of the objects of a channel on the graphics engine, for
@@ -508,6 +543,8 @@ struct drm_nova_channel_create {
 	 * @classes: DRM_NOVA_ENGINE_GRAPHICS: the classes of the objects the
 	 * channel has, DRM_NOVA_CLASS_* flags, not 0. DRM_NOVA_ENGINE_COPY:
 	 * should be 0, the channel has a copy object.
+	 * DRM_NOVA_ENGINE_VIDEO_DECODER: should be 0, the channel has a video
+	 * decoder object.
 	 */
 	__u32 classes;
 

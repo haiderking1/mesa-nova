@@ -98,6 +98,18 @@ nova_device_info(int fd, const struct _drmDevice *drm_device,
    info->max_blocks_per_mp = nv_max_blocks_per_mp_for_sm(info->sm);
    nv_device_info_init_shared_mem_sizes(info);
 
+   /* Video decoding runs on channels of the video decoder engine, which not
+    * every GPU has, nor every nova-drm knows.
+    */
+   struct drm_nova_info_video_decoder dec = {};
+   err = nova_info(fd, DRM_NOVA_INFO_VIDEO_DECODER, &dec, sizeof(dec));
+   if (err == 0) {
+      info->cls_vdec = dec.class_video_decoder;
+      info->has_video = true;
+   } else if (err != -ENODEV && err != -EINVAL) {
+      return err;
+   }
+
    /* The marketing name of the board, if known, else nova-core's. */
    const char *name =
       nv_device_name_for_chip(drm_device->deviceinfo.pci->device_id,
