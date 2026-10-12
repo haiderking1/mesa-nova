@@ -390,6 +390,15 @@ set_yuv_layer(struct vl_compositor_state *s, struct vl_compositor *c,
             s->layers[layer].cs = c->cs_yuv.progressive.uv;
          break;
       }
+      /* A progressive buffer's picture is its only layer, sampled as it is:
+       * weaving it would take every other line of its single field.
+       */
+      if (!buffer->interlaced) {
+         s->layers[layer].zw.x = 0.0f;
+         if (c->pipe_gfx_supported)
+            s->layers[layer].fs = (y) ? c->fs_yuv.bob.y : c->fs_yuv.bob.uv;
+         break;
+      }
       FALLTHROUGH;
 
    default:
