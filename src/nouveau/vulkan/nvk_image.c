@@ -104,6 +104,12 @@ nvk_get_image_plane_format_features(const struct nvk_physical_device *pdev,
    if (p_format == PIPE_FORMAT_R8_UINT && tiling == VK_IMAGE_TILING_OPTIMAL)
       features |= VK_FORMAT_FEATURE_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR;
 
+   /* NIL supports the format, as it has features: and the modifier? */
+   if (features != 0 && tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT &&
+       !nil_drm_format_mod_is_supported(&pdev->info, nil_format(p_format),
+                                        drm_format_mod))
+      return 0;
+
    if (features != 0) {
       features |= VK_FORMAT_FEATURE_2_TRANSFER_SRC_BIT;
       features |= VK_FORMAT_FEATURE_2_TRANSFER_DST_BIT;
@@ -185,10 +191,16 @@ nvk_get_image_format_features(const struct nvk_physical_device *pdev,
    if (cosited_chroma)
       features |= VK_FORMAT_FEATURE_COSITED_CHROMA_SAMPLES_BIT;
 
-   /* At least advertise support for NV12. This is incomplete. */
+   /* At least advertise support for NV12. This is incomplete. The decoder
+    * writes block linear images of one block height (see
+    * nil_drm_format_mod_supports_video()), not linear ones.
+    */
    const struct nvk_instance *instance = nvk_physical_device_instance(pdev);
    if (vk_format == VK_FORMAT_G8_B8R8_2PLANE_420_UNORM &&
-       nvk_video_enabled(instance, &pdev->info)) {
+       nvk_video_enabled(instance, &pdev->info) &&
+       (tiling == VK_IMAGE_TILING_OPTIMAL ||
+        (tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT &&
+         nil_drm_format_mod_supports_video(drm_format_mod)))) {
       features |= VK_FORMAT_FEATURE_VIDEO_DECODE_OUTPUT_BIT_KHR;
       features |= VK_FORMAT_FEATURE_VIDEO_DECODE_DPB_BIT_KHR;
    }
@@ -227,8 +239,18 @@ nvk_get_drm_format_modifier_properties_list(const struct nvk_physical_device *pd
    const struct vk_format_ycbcr_info *ycbcr_info =
       vk_format_get_ycbcr_info(vk_format);
    if (ycbcr_info != NULL) {
-      mods[0] = DRM_FORMAT_MOD_LINEAR;
-      mod_count = 1;
+      /* The modifiers of the first plane's format, which the features below
+       * narrow down to those every plane supports, then LINEAR.
+       */
+      mod_count = NIL_MAX_DRM_FORMAT_MODS;
+      enum pipe_format p_format =
+         nvk_format_to_pipe_format(ycbcr_info->planes[0].format);
+      nil_drm_format_mods_for_format(&pdev->info, nil_format(p_format),
+                                     &mod_count, &mods);
+      if (mod_count == 0) {
+         mods[0] = DRM_FORMAT_MOD_LINEAR;
+         mod_count = 1;
+      }
    } else {
       mod_count = NIL_MAX_DRM_FORMAT_MODS;
       enum pipe_format p_format = nvk_format_to_pipe_format(vk_format);
@@ -469,6 +491,16 @@ nvk_GetPhysicalDeviceImageFormatProperties2(
                                    VK_IMAGE_USAGE_VIDEO_ENCODE_DPB_BIT_KHR)) &&
        (pImageFormatInfo->flags & (VK_IMAGE_CREATE_SPARSE_ALIASED_BIT |
                                    VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT)))
+      return VK_ERROR_FORMAT_NOT_SUPPORTED;
+
+   /* The decoder writes block linear images of one block height, not linear
+    * ones (see nil_drm_format_mod_supports_video()).
+    */
+   if ((pImageFormatInfo->usage & (VK_IMAGE_USAGE_VIDEO_DECODE_DST_BIT_KHR |
+                                   VK_IMAGE_USAGE_VIDEO_DECODE_DPB_BIT_KHR)) &&
+       (pImageFormatInfo->tiling == VK_IMAGE_TILING_LINEAR ||
+        (pImageFormatInfo->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT &&
+         !nil_drm_format_mod_supports_video(drm_format_mod))))
       return VK_ERROR_FORMAT_NOT_SUPPORTED;
 
    /* With disjoint, the client is allowed to create another image with a format
@@ -852,6 +884,47 @@ nvk_image_can_compress(const struct nvk_physical_device *pdev,
    return true;
 }
 
+/* The NIL description of the given plane of the image. */
+static struct nil_image_init_info
+nvk_image_plane_nil_info(const struct nvk_image *image, uint8_t plane,
+                         nil_image_usage_flags usage, uint64_t modifier,
+                         uint32_t explicit_row_stride_B,
+                         uint32_t max_alignment_B)
+{
+   const struct vk_format_ycbcr_info *ycbcr_info =
+      vk_format_get_ycbcr_info(image->vk.format);
+   VkFormat format = ycbcr_info ?
+      ycbcr_info->planes[plane].format : image->vk.format;
+   const uint8_t width_scale = ycbcr_info ?
+      ycbcr_info->planes[plane].denominator_scales[0] : 1;
+   const uint8_t height_scale = ycbcr_info ?
+      ycbcr_info->planes[plane].denominator_scales[1] : 1;
+
+   if (image->separate_zs) {
+      if (plane == 0)
+         format = vk_format_depth_only(format);
+      else if (plane == 1)
+         format = vk_format_stencil_only(format);
+   }
+
+   return (struct nil_image_init_info) {
+      .dim = vk_image_type_to_nil_dim(image->vk.image_type),
+      .format = nil_format(nvk_format_to_pipe_format(format)),
+      .modifier = modifier,
+      .extent_px = {
+         .width = image->vk.extent.width / width_scale,
+         .height = image->vk.extent.height / height_scale,
+         .depth = image->vk.extent.depth,
+         .array_len = image->vk.array_layers,
+      },
+      .levels = image->vk.mip_levels,
+      .samples = image->vk.samples,
+      .usage = usage,
+      .explicit_row_stride_B = explicit_row_stride_B,
+      .max_alignment_B = max_alignment_B,
+   };
+}
+
 static VkResult
 nvk_image_init(struct nvk_device *dev,
                struct nvk_image *image,
@@ -964,18 +1037,21 @@ nvk_image_init(struct nvk_device *dev,
                                  IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT);
 
          if (ycbcr_info != NULL) {
-            /* Multi-planar formats only ever advertise LINEAR (see
-             * nvk_get_drm_format_properties()), and nil has no format for the
-             * combined multi-planar format, so pick LINEAR out of the list
-             * rather than asking nil to choose.
+            /* nil has no format for the combined multi-planar format: it
+             * picks a modifier every plane supports.
              */
-            image->vk.drm_format_mod = DRM_FORMAT_MOD_INVALID;
-            for (uint32_t i = 0; i < mod_list_info->drmFormatModifierCount; i++) {
-               if (mod_list_info->pDrmFormatModifiers[i] == DRM_FORMAT_MOD_LINEAR) {
-                  image->vk.drm_format_mod = DRM_FORMAT_MOD_LINEAR;
-                  break;
-               }
+            struct nil_image_init_info plane_infos[NVK_MAX_IMAGE_PLANES];
+            for (uint8_t plane = 0; plane < image->plane_count; plane++) {
+               plane_infos[plane] =
+                  nvk_image_plane_nil_info(image, plane, usage,
+                                           DRM_FORMAT_MOD_INVALID, 0,
+                                           max_alignment_B);
             }
+            image->vk.drm_format_mod =
+               nil_select_best_drm_format_mod_planar(&pdev->info, plane_infos,
+                                                     image->plane_count,
+                                                     mod_list_info->drmFormatModifierCount,
+                                                     mod_list_info->pDrmFormatModifiers);
          } else {
             enum pipe_format p_format =
                nvk_format_to_pipe_format(image->vk.format);
@@ -1038,37 +1114,21 @@ nvk_image_init(struct nvk_device *dev,
     */
    struct nil_image_init_info nil_info[NVK_MAX_IMAGE_PLANES];
    for (uint8_t plane = 0; plane < image->plane_count; plane++) {
-      VkFormat format = ycbcr_info ?
-         ycbcr_info->planes[plane].format : image->vk.format;
-      const uint8_t width_scale = ycbcr_info ?
-         ycbcr_info->planes[plane].denominator_scales[0] : 1;
-      const uint8_t height_scale = ycbcr_info ?
-         ycbcr_info->planes[plane].denominator_scales[1] : 1;
-
-      if (image->separate_zs) {
-         if (plane == 0)
-            format = vk_format_depth_only(format);
-         else if (plane == 1)
-            format = vk_format_stencil_only(format);
-      }
-
-      nil_info[plane] = (struct nil_image_init_info) {
-         .dim = vk_image_type_to_nil_dim(image->vk.image_type),
-         .format = nil_format(nvk_format_to_pipe_format(format)),
-         .modifier = image->vk.drm_format_mod,
-         .extent_px = {
-            .width = image->vk.extent.width / width_scale,
-            .height = image->vk.extent.height / height_scale,
-            .depth = image->vk.extent.depth,
-            .array_len = image->vk.array_layers,
-         },
-         .levels = image->vk.mip_levels,
-         .samples = image->vk.samples,
-         .usage = usage,
-         .explicit_row_stride_B = explicit_row_stride_B[plane],
-         .max_alignment_B = max_alignment_B,
-      };
+      nil_info[plane] =
+         nvk_image_plane_nil_info(image, plane, usage, image->vk.drm_format_mod,
+                                  explicit_row_stride_B[plane],
+                                  max_alignment_B);
    }
+
+   /* An explicit modifier the planes don't all support, or (for video) don't
+    * all keep the block height of.
+    */
+   if (ycbcr_info != NULL &&
+       image->vk.drm_format_mod != DRM_FORMAT_MOD_INVALID &&
+       !nil_drm_format_mod_is_supported_planar(&pdev->info, nil_info,
+                                               image->plane_count,
+                                               image->vk.drm_format_mod))
+      return vk_error(dev, VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT);
 
    if (usage & NIL_IMAGE_USAGE_VIDEO_BIT) {
       assert(!image->disjoint);
