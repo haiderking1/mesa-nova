@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: MIT
 
 use crate::format::Format;
-use crate::image::Image;
-use crate::tiling::{GOBType, Tiling};
+use crate::image::{Image, ImageInitInfo, SampleLayout, IMAGE_USAGE_VIDEO_BIT};
+use crate::tiling::{GOBType, Tiling, VIDEO_Y_LOG2};
 
 use mesa_util::bitview::*;
 
@@ -353,6 +353,69 @@ pub fn drm_format_mod_is_supported(
     true
 }
 
+#[unsafe(no_mangle)]
+pub extern "C" fn nil_drm_format_mod_is_supported(
+    dev: &nil_rs_bindings::nv_device_info,
+    format: Format,
+    modifier: u64,
+) -> bool {
+    drm_format_mod_is_supported(dev, format, modifier)
+}
+
+/// Whether the video engines can write images of `modifier`: they only write
+/// block linear images, of the block height they take whatever the image's
+/// size (see [`VIDEO_Y_LOG2`]).
+#[unsafe(no_mangle)]
+pub extern "C" fn nil_drm_format_mod_supports_video(modifier: u64) -> bool {
+    BlockLinearModifier::try_from(modifier)
+        .is_ok_and(|bl_mod| bl_mod.height_log2() == VIDEO_Y_LOG2)
+}
+
+/// Whether `modifier` lays out the image whose planes `infos` describes: every
+/// plane supports it, and for video, every plane keeps its block height, as
+/// the video engines take one block height for all of them.
+pub fn drm_format_mod_is_supported_planar(
+    dev: &nil_rs_bindings::nv_device_info,
+    infos: &[ImageInitInfo],
+    modifier: u64,
+) -> bool {
+    if !infos
+        .iter()
+        .all(|info| drm_format_mod_is_supported(dev, info.format, modifier))
+    {
+        return false;
+    }
+
+    if infos
+        .iter()
+        .any(|info| (info.usage & IMAGE_USAGE_VIDEO_BIT) != 0)
+    {
+        if !nil_drm_format_mod_supports_video(modifier) {
+            return false;
+        }
+        let tiling = BlockLinearModifier::try_from(modifier).unwrap().tiling();
+        for info in infos {
+            let extent_B = info.extent_px.to_B(info.format, SampleLayout::_1x1);
+            if tiling.clamp(extent_B).y_log2 != tiling.y_log2 {
+                return false;
+            }
+        }
+    }
+
+    true
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nil_drm_format_mod_is_supported_planar(
+    dev: &nil_rs_bindings::nv_device_info,
+    infos: *const ImageInitInfo,
+    plane_count: usize,
+    modifier: u64,
+) -> bool {
+    let infos = unsafe { std::slice::from_raw_parts(infos, plane_count) };
+    drm_format_mod_is_supported_planar(dev, infos, modifier)
+}
+
 fn score_drm_format_mod(modifier: u64) -> u32 {
     if modifier == DRM_FORMAT_MOD_LINEAR {
         return 1;
@@ -403,4 +466,44 @@ pub extern "C" fn nil_select_best_drm_format_mod(
     let modifiers =
         unsafe { std::slice::from_raw_parts(modifiers, modifier_count) };
     select_best_drm_format_mod(dev, format, modifiers)
+}
+
+/// Selects the best of `modifiers` for the image whose planes `infos`
+/// describes, as [`select_best_drm_format_mod`] does for one plane: one every
+/// plane supports (see [`drm_format_mod_is_supported_planar`]).
+pub fn select_best_drm_format_mod_planar(
+    dev: &nil_rs_bindings::nv_device_info,
+    infos: &[ImageInitInfo],
+    modifiers: &[u64],
+) -> u64 {
+    let mut best = DRM_FORMAT_MOD_INVALID;
+    let mut best_score = 0;
+
+    for &modifier in modifiers {
+        if !drm_format_mod_is_supported_planar(dev, infos, modifier) {
+            continue;
+        }
+
+        let score = score_drm_format_mod(modifier);
+        if score > best_score {
+            best = modifier;
+            best_score = score;
+        }
+    }
+
+    best
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nil_select_best_drm_format_mod_planar(
+    dev: &nil_rs_bindings::nv_device_info,
+    infos: *const ImageInitInfo,
+    plane_count: usize,
+    modifier_count: usize,
+    modifiers: *const u64,
+) -> u64 {
+    let infos = unsafe { std::slice::from_raw_parts(infos, plane_count) };
+    let modifiers =
+        unsafe { std::slice::from_raw_parts(modifiers, modifier_count) };
+    select_best_drm_format_mod_planar(dev, infos, modifiers)
 }
