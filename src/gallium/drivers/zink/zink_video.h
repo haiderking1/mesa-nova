@@ -38,6 +38,11 @@
 struct zink_video_codec {
    struct pipe_video_codec base;
    struct pipe_screen *screen;
+   /* The context the codec decodes on, whose batches go to the video queue:
+    * the frontend's (base.context) does the rest of the work, such as copies,
+    * blits and draws, which the video queue can't run.
+    */
+   struct pipe_context *decode_ctx;
    /* The bitstream of the frame, gathered as it comes, then uploaded to
     * bitstream_res at bs_offset, bs_range bytes with the padding.
     */

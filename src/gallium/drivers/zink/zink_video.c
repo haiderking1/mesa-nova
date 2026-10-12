@@ -80,6 +80,7 @@ zink_destroy_video_codec(struct pipe_video_codec *codec) {
    /* The pictures keep their data, which other codecs may use, and which is
     * freed with them: see picture_data().
     */
+   zvc->decode_ctx->destroy(zvc->decode_ctx);
    /* ensure session is no longer in use */
    VKSCR(QueueWaitIdle)(screen->queue_video_decode);
    VKSCR(DestroyVideoSessionKHR)(screen->dev,
@@ -257,7 +258,7 @@ zink_begin_frame(struct pipe_video_codec *codec,
                  struct pipe_picture_desc *picture)
 {
    struct zink_video_codec *zvc = (struct zink_video_codec *)codec;
-   struct zink_context *ctx = zink_context(codec->context);
+   struct zink_context *ctx = zink_context(zvc->decode_ctx);
    struct zink_screen *screen = zink_screen(ctx->base.screen);
    zink_resource_reference(&zvc->bitstream_res, NULL);
    zvc->bs_size = 0;
@@ -520,7 +521,7 @@ zink_end_frame_h264(struct pipe_video_codec *codec,
                     struct pipe_picture_desc *picture)
 {
    struct zink_video_codec *zvc = (struct zink_video_codec *)codec;
-   struct zink_context *ctx = zink_context(codec->context);
+   struct zink_context *ctx = zink_context(zvc->decode_ctx);
    struct zink_screen *screen = (struct zink_screen *)zvc->screen;
    struct pipe_h264_picture_desc *h264 = (struct pipe_h264_picture_desc *)picture;
 
@@ -838,7 +839,7 @@ zink_end_frame_vp9(struct pipe_video_codec *codec,
                    struct pipe_picture_desc *picture)
 {
    struct zink_video_codec *zvc = (struct zink_video_codec *)codec;
-   struct zink_context *ctx = zink_context(codec->context);
+   struct zink_context *ctx = zink_context(zvc->decode_ctx);
    struct zink_screen *screen = (struct zink_screen *)zvc->screen;
    struct pipe_vp9_picture_desc *vp9 = (struct pipe_vp9_picture_desc *)picture;
    const bool intra = vp9->picture_parameter.pic_fields.frame_type == 0 || vp9->picture_parameter.pic_fields.intra_only;
@@ -1194,7 +1195,7 @@ zink_end_frame_av1(struct pipe_video_codec *codec,
                    struct pipe_picture_desc *picture)
 {
    struct zink_video_codec *zvc = (struct zink_video_codec *)codec;
-   struct zink_context *ctx = zink_context(codec->context);
+   struct zink_context *ctx = zink_context(zvc->decode_ctx);
    struct zink_screen *screen = (struct zink_screen *)zvc->screen;
    struct pipe_av1_picture_desc *av1 = (struct pipe_av1_picture_desc *)picture;
    const StdVideoAV1FrameType frame_type = av1->picture_parameter.pic_info_fields.frame_type;
@@ -1656,6 +1657,13 @@ zink_create_video_codec(struct pipe_context *pctx, const struct pipe_video_codec
    }
    zvc->base.flush = zink_video_flush;
    zvc->base.context = pctx;
+
+   zvc->decode_ctx = pctx->screen->context_create(pctx->screen, NULL,
+                                                  ZINK_CONTEXT_VIDEO_QUEUE);
+   if (!zvc->decode_ctx) {
+      FREE(zvc);
+      return NULL;
+   }
 
    zvc->screen = pctx->screen;
    zvc->bitstream_mgr = u_upload_create(pctx, BITSTREAM_UPLOAD_SIZE, ZINK_BIND_VIDEO, PIPE_USAGE_STAGING, 0);

@@ -312,7 +312,7 @@ create_batch_state(struct zink_context *ctx)
    bs->ctx = ctx;
    VkCommandPoolCreateInfo cpci = {0};
    cpci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-   bs->is_video = (bs->ctx->flags & PIPE_CONTEXT_VIDEO) > 0;
+   bs->is_video = (bs->ctx->flags & ZINK_CONTEXT_VIDEO_QUEUE) > 0;
    cpci.queueFamilyIndex = bs->is_video ? screen->video_decode_queue : screen->gfx_queue;
    VkResult result;
 
@@ -421,7 +421,7 @@ find_screen_state(struct zink_screen *screen, struct zink_context *ctx)
 {
    struct zink_batch_state *bs = NULL;
    struct zink_batch_state *prev = NULL;
-   bool is_video = (ctx->flags & PIPE_CONTEXT_VIDEO) > 0;
+   bool is_video = (ctx->flags & ZINK_CONTEXT_VIDEO_QUEUE) > 0;
    simple_mtx_lock(&screen->free_batch_states_lock);
    for (bs = screen->free_batch_states; bs; prev = bs, bs = bs->next) {
       if (bs->is_video == is_video)
@@ -606,10 +606,10 @@ zink_start_batch(struct zink_context *ctx)
 #endif
 
    /* descriptor buffers must always be bound at the start of a batch */
-   if (zink_descriptor_mode == ZINK_DESCRIPTOR_MODE_DB && !(ctx->flags & (ZINK_CONTEXT_COPY_ONLY | PIPE_CONTEXT_VIDEO)))
+   if (zink_descriptor_mode == ZINK_DESCRIPTOR_MODE_DB && !(ctx->flags & (ZINK_CONTEXT_COPY_ONLY | ZINK_CONTEXT_VIDEO_QUEUE)))
       zink_batch_bind_db(ctx);
    /* zero init for unordered blits */
-   if (!(ctx->flags & PIPE_CONTEXT_VIDEO) && screen->info.have_EXT_attachment_feedback_loop_dynamic_state) {
+   if (!(ctx->flags & ZINK_CONTEXT_VIDEO_QUEUE) && screen->info.have_EXT_attachment_feedback_loop_dynamic_state) {
       VKCTX(CmdSetAttachmentFeedbackLoopEnableEXT)(ctx->bs->cmdbuf, 0);
       VKCTX(CmdSetAttachmentFeedbackLoopEnableEXT)(ctx->bs->reordered_cmdbuf, 0);
       VKCTX(CmdSetAttachmentFeedbackLoopEnableEXT)(ctx->bs->unsynchronized_cmdbuf, 0);
@@ -844,14 +844,14 @@ submit_queue(void *data, void *gdata, int thread_index)
    screen->last_submit_id = batch_id;
    screen->last_submit_is_video = bs->is_video;
    VRAM_ALLOC_LOOP(result,
-      VKSCR(QueueSubmit)(bs->ctx->flags & PIPE_CONTEXT_VIDEO ? screen->queue_video_decode : screen->queue, num_si, submit, VK_NULL_HANDLE),
+      VKSCR(QueueSubmit)(bs->ctx->flags & ZINK_CONTEXT_VIDEO_QUEUE ? screen->queue_video_decode : screen->queue, num_si, submit, VK_NULL_HANDLE),
       if (result != VK_SUCCESS) {
          mesa_loge("ZINK: vkQueueSubmit failed (%s)", vk_Result_to_str(result));
          bs->is_device_lost = true;
       }
    );
    /* FIXME: delet this */
-   if (bs->ctx->flags & PIPE_CONTEXT_VIDEO)
+   if (bs->ctx->flags & ZINK_CONTEXT_VIDEO_QUEUE)
       screen->VIDEO_PRESENT_HACK = true;
    simple_mtx_unlock(screen->queue_lock);
 

@@ -2983,7 +2983,7 @@ zink_image_map(struct pipe_context *pctx,
    struct zink_context *ctx = zink_context(pctx);
    struct zink_screen *screen = zink_screen(pctx->screen);
    struct zink_resource *res = zink_resource(pres);
-   if (ctx->flags & PIPE_CONTEXT_VIDEO) {
+   if (ctx->flags & ZINK_CONTEXT_VIDEO_QUEUE) {
       zink_resource_usage_wait(ctx, res, ZINK_RESOURCE_ACCESS_RW);
       zink_screen_lock_context(screen);
       void *map = zink_image_map(&screen->copy_context->base, pres, level, usage, box, transfer);
@@ -3126,7 +3126,7 @@ zink_image_subdata(struct pipe_context *pctx,
    struct zink_resource *res = zink_resource(pres);
 
    res->subdata = true;
-   if (ctx->flags & PIPE_CONTEXT_VIDEO) {
+   if (ctx->flags & ZINK_CONTEXT_VIDEO_QUEUE) {
       /* video context only uses video queue and cannot access transfer ops */
       zink_screen_lock_context(screen);
       zink_image_subdata(&screen->copy_context->base, pres, level, usage, box, data, stride, layer_stride);
@@ -3554,7 +3554,7 @@ zink_image_unmap(struct pipe_context *pctx, struct pipe_transfer *ptrans)
    struct zink_screen *screen = zink_screen(pctx->screen);
    struct zink_context *ctx = zink_context(pctx);
    struct zink_transfer *trans = (struct zink_transfer *)ptrans;
-   if (ctx->flags & PIPE_CONTEXT_VIDEO) {
+   if (ctx->flags & ZINK_CONTEXT_VIDEO_QUEUE) {
       bool is_write = (ptrans->usage & PIPE_MAP_WRITE) > 0;
       zink_screen_lock_context(screen);
       zink_image_unmap(&screen->copy_context->base, ptrans);

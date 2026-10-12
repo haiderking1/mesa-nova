@@ -105,6 +105,11 @@
 /* flag to create screen->copy_context */
 #define ZINK_CONTEXT_COPY_ONLY (1<<30)
 
+/* flag to create the context a video codec decodes on, whose batches go to the
+ * video queue: it does nothing else, as that queue only runs video coding
+ */
+#define ZINK_CONTEXT_VIDEO_QUEUE (1<<29)
+
 /* convenience macros for accessing dispatch table functions */
 #define VKCTX(fn) zink_screen(ctx->base.screen)->vk.fn
 #define VKSCR(fn) screen->vk.fn

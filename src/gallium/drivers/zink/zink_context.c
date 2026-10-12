@@ -4112,7 +4112,7 @@ flush_batch(struct zink_context *ctx, bool sync)
       check_device_lost(ctx);
    } else {
       zink_start_batch(ctx);
-      if (!(ctx->flags & PIPE_CONTEXT_VIDEO))
+      if (!(ctx->flags & ZINK_CONTEXT_VIDEO_QUEUE))
          reset_graphics_states(ctx);
    }
    util_queue_fence_signal(&ctx->flush_fence);
@@ -5879,7 +5879,7 @@ zink_context_create(struct pipe_screen *pscreen, void *priv, unsigned flags)
    struct zink_screen *screen = zink_screen(pscreen);
    struct zink_context *ctx = rzalloc(NULL, struct zink_context);
    bool is_copy_only = (flags & ZINK_CONTEXT_COPY_ONLY) > 0;
-   bool is_compute_only = (flags & (PIPE_CONTEXT_COMPUTE_ONLY | PIPE_CONTEXT_VIDEO)) > 0;
+   bool is_compute_only = (flags & (PIPE_CONTEXT_COMPUTE_ONLY | ZINK_CONTEXT_VIDEO_QUEUE)) > 0;
    bool is_robust = (flags & PIPE_CONTEXT_ROBUST_BUFFER_ACCESS) > 0;
    if (!ctx)
       goto fail;
