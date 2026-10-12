@@ -283,11 +283,21 @@ nvk_GetPhysicalDeviceVideoCapabilitiesKHR(VkPhysicalDevice physicalDevice,
    if (dec_caps)
       dec_caps->flags = VK_VIDEO_DECODE_CAPABILITY_DPB_AND_OUTPUT_COINCIDE_BIT_KHR;
 
-   /* H264 allows different luma and chroma bit depths */
-   if (pVideoProfile->lumaBitDepth != pVideoProfile->chromaBitDepth)
+   /* AV1's main profile has monochrome pictures too, which the decoder
+    * writes as 4:2:0 ones of neutral chroma, as the pictures of their
+    * profiles are (see nvk_GetPhysicalDeviceVideoFormatPropertiesKHR()).
+    */
+   const bool monochrome =
+      pVideoProfile->chromaSubsampling == VK_VIDEO_CHROMA_SUBSAMPLING_MONOCHROME_BIT_KHR &&
+      pVideoProfile->videoCodecOperation == VK_VIDEO_CODEC_OPERATION_DECODE_AV1_BIT_KHR;
+   if (pVideoProfile->chromaSubsampling != VK_VIDEO_CHROMA_SUBSAMPLING_420_BIT_KHR &&
+       !monochrome)
       return VK_ERROR_VIDEO_PROFILE_FORMAT_NOT_SUPPORTED_KHR;
 
-   if (pVideoProfile->chromaSubsampling != VK_VIDEO_CHROMA_SUBSAMPLING_420_BIT_KHR)
+   /* H264 allows different luma and chroma bit depths. Monochrome profiles
+    * have no chroma, whose bit depth they leave out.
+    */
+   if (!monochrome && pVideoProfile->lumaBitDepth != pVideoProfile->chromaBitDepth)
       return VK_ERROR_VIDEO_PROFILE_FORMAT_NOT_SUPPORTED_KHR;
 
    switch (pVideoProfile->videoCodecOperation) {
@@ -457,7 +467,8 @@ nvk_GetPhysicalDeviceVideoFormatPropertiesKHR(VkPhysicalDevice physicalDevice,
       return VK_ERROR_IMAGE_USAGE_NOT_SUPPORTED_KHR;
 
    /* The pictures of the profiles' bit depth: NV12, or P010 of 10 bits, in
-    * the high bits of 16. The profiles all have to be of the same.
+    * the high bits of 16, monochrome ones too, of neutral chroma. The
+    * profiles all have to be of the same.
     */
    const VkVideoProfileListInfoKHR *profiles =
       vk_find_struct_const(pVideoFormatInfo->pNext,
