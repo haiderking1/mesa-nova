@@ -42,6 +42,10 @@ void vlVaHandlePictureParameterBufferVP9(vlVaDriver *drv, vlVaContext *context, 
    context->desc.vp9.picture_parameter.frame_width = vp9->frame_width;
    context->desc.vp9.picture_parameter.frame_height = vp9->frame_height;
 
+   /* The previous frame's, for use_prev_frame_mvs. */
+   const bool prev_intra = context->desc.vp9.picture_parameter.pic_fields.frame_type == 0 ||
+                           context->desc.vp9.picture_parameter.pic_fields.intra_only;
+
    context->desc.vp9.picture_parameter.pic_fields.subsampling_x = vp9->pic_fields.bits.subsampling_x;
    context->desc.vp9.picture_parameter.pic_fields.subsampling_y = vp9->pic_fields.bits.subsampling_y;
    context->desc.vp9.picture_parameter.pic_fields.frame_type = vp9->pic_fields.bits.frame_type;
@@ -68,7 +72,7 @@ void vlVaHandlePictureParameterBufferVP9(vlVaDriver *drv, vlVaContext *context, 
    context->desc.vp9.picture_parameter.pic_fields.alt_ref_frame_sign_bias = vp9->pic_fields.bits.alt_ref_frame_sign_bias;
    context->desc.vp9.picture_parameter.pic_fields.lossless_flag = vp9->pic_fields.bits.lossless_flag;
    context->desc.vp9.picture_parameter.pic_fields.use_prev_frame_mvs =
-      context->desc.vp9.picture_parameter.pic_fields.prev_show_frame &&
+      context->desc.vp9.picture_parameter.pic_fields.prev_show_frame && !prev_intra &&
       !context->desc.vp9.picture_parameter.pic_fields.error_resilient_mode &&
       context->desc.vp9.picture_parameter.prev_frame_width == context->desc.vp9.picture_parameter.frame_width &&
       context->desc.vp9.picture_parameter.prev_frame_height == context->desc.vp9.picture_parameter.frame_height;
@@ -201,18 +205,17 @@ static signed vp9_s(struct vl_vlc *vlc, unsigned n)
    return s ? -v : v;
 }
 
-static void bitdepth_colorspace_sampling(struct vl_vlc *vlc, unsigned profile)
+static void bitdepth_colorspace_sampling(struct vl_vlc *vlc, unsigned profile,
+                                         struct pipe_vp9_picture_desc *desc)
 {
-   unsigned cs;
-
    if (profile == 2)
       /* bit_depth */
       vp9_u(vlc, 1);
 
-   cs = vp9_u(vlc, 3);
-   if (cs != 7)
-      /* yuv_range_flag */
-      vp9_u(vlc, 1);
+   desc->picture_parameter.color_space = vp9_u(vlc, 3);
+   /* color_range, which CS_RGB (7) has full */
+   desc->picture_parameter.color_range =
+      desc->picture_parameter.color_space == 7 || vp9_u(vlc, 1);
 }
 
 static void frame_size(struct vl_vlc *vlc)
@@ -267,8 +270,9 @@ void vlVaDecoderVP9BitstreamHeader(vlVaContext *context, vlVaBuffer *buf)
       if (vp9_u(&vlc, 24) != 0x498342)
          return;
 
-      bitdepth_colorspace_sampling(&vlc, profile);
+      bitdepth_colorspace_sampling(&vlc, profile, &context->desc.vp9);
       frame_size(&vlc);
+      context->desc.vp9.picture_parameter.refresh_frame_flags = 0xff;
    } else {
       bool size_in_refs = false;
 
@@ -282,14 +286,17 @@ void vlVaDecoderVP9BitstreamHeader(vlVaContext *context, vlVaBuffer *buf)
          if (vp9_u(&vlc, 24) != 0x498342)
             return;
 
-         if (profile > 0)
-            bitdepth_colorspace_sampling(&vlc, profile);
-         /* refresh_frame_flags */
-         vp9_u(&vlc, 8);
+         if (profile > 0) {
+            bitdepth_colorspace_sampling(&vlc, profile, &context->desc.vp9);
+         } else {
+            /* CS_BT_601, studio range */
+            context->desc.vp9.picture_parameter.color_space = 1;
+            context->desc.vp9.picture_parameter.color_range = false;
+         }
+         context->desc.vp9.picture_parameter.refresh_frame_flags = vp9_u(&vlc, 8);
          frame_size(&vlc);
       } else {
-         /* refresh_frame_flags */
-         vp9_u(&vlc, 8);
+         context->desc.vp9.picture_parameter.refresh_frame_flags = vp9_u(&vlc, 8);
 
          for (i = 0; i < 3; ++i) {
             /* frame refs */
@@ -347,7 +354,19 @@ void vlVaDecoderVP9BitstreamHeader(vlVaContext *context, vlVaBuffer *buf)
 
       context->desc.vp9.picture_parameter.mode_deltas[0] = 0;
       context->desc.vp9.picture_parameter.mode_deltas[1] = 0;
+
+      /* The segmentation features go too (setup_past_independence()). */
+      context->desc.vp9.picture_parameter.abs_delta = 0;
+      for (i = 0; i < 8; ++i) {
+         context->desc.vp9.slice_parameter.seg_param[i].alt_quant_enabled = false;
+         context->desc.vp9.slice_parameter.seg_param[i].alt_quant = 0;
+         context->desc.vp9.slice_parameter.seg_param[i].alt_lf_enabled = false;
+         context->desc.vp9.slice_parameter.seg_param[i].alt_lf = 0;
+      }
    }
+
+   context->desc.vp9.picture_parameter.update_ref_delta = 0;
+   context->desc.vp9.picture_parameter.update_mode_delta = 0;
 
    mode_ref_delta_enabled = vp9_u(&vlc, 1);
    if (mode_ref_delta_enabled) {
@@ -355,15 +374,17 @@ void vlVaDecoderVP9BitstreamHeader(vlVaContext *context, vlVaBuffer *buf)
       if (mode_ref_delta_update) {
          for (i = 0; i < 4; ++i) {
             /* update_ref_delta */
-            if (vp9_u(&vlc, 1))
-               /* ref_deltas */
+            if (vp9_u(&vlc, 1)) {
+               context->desc.vp9.picture_parameter.update_ref_delta |= 1 << i;
                context->desc.vp9.picture_parameter.ref_deltas[i] = vp9_s(&vlc, 6);
+            }
          }
          for (i = 0; i < 2; ++i) {
             /* update_mode_delta */
-            if (vp9_u(&vlc, 1))
-               /* mode_deltas */
+            if (vp9_u(&vlc, 1)) {
+               context->desc.vp9.picture_parameter.update_mode_delta |= 1 << i;
                context->desc.vp9.picture_parameter.mode_deltas[i] = vp9_s(&vlc, 6);
+            }
          }
       }
    }
