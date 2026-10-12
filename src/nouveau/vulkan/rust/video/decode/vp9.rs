@@ -586,8 +586,11 @@ impl VideoDecoder for Decoder {
         let max_sbs = u64::from(session.vk.max_coded.width.div_ceil(SB_SIZE))
             * u64::from(session.vk.max_coded.height.div_ceil(SB_SIZE));
         let seg_mv = session.mems[ffi::NVK_VP9_MEM_SEG_MV as usize].addr;
-        let seg_map_size = max_sbs * u64::from(ffi::NVK_VP9_SEG_MAP_SB_B);
-        let col_mv_size = max_sbs * u64::from(ffi::NVK_VP9_COL_MV_SB_B);
+        let buf_align = u64::from(ffi::NVK_VP9_BUF_ALIGN_B);
+        let seg_map_size = (max_sbs * u64::from(ffi::NVK_VP9_SEG_MAP_SB_B))
+            .next_multiple_of(buf_align);
+        let col_mv_size = (max_sbs * u64::from(ffi::NVK_VP9_COL_MV_SB_B))
+            .next_multiple_of(buf_align);
         let seg_map = |i: usize| seg_mv + i as u64 * seg_map_size;
         let col_mv =
             |i: usize| seg_mv + 2 * seg_map_size + i as u64 * col_mv_size;
