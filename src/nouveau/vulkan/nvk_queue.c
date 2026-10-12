@@ -249,6 +249,9 @@ nvk_queue_submit_exec(struct nvk_queue *queue,
       struct nvk_cmd_buffer *cmd =
          container_of(submit->command_buffers[i], struct nvk_cmd_buffer, vk);
 
+      if (cmd->video_fixups != NULL)
+         nvk_video_cmd_buffer_submit(cmd);
+
       const uint32_t max_execs =
          util_dynarray_num_elements(&cmd->pushes, struct nvk_cmd_push);
       STACK_ARRAY(struct nvkmd_ctx_exec, execs, max_execs);

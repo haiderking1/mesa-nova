@@ -23,6 +23,8 @@
 //! How NVIDIA's driver programs the decoder was found by recording what it
 //! has it do for the same streams on an RTX 3070 (GA104).
 
+use std::sync::{Arc, Mutex};
+
 use nv_push_rs::*;
 use nvidia_headers::classes::clc7b0::mthd as clc7b0;
 
@@ -36,7 +38,10 @@ use crate::util::vk_find_struct_const;
 use crate::video::decode::VideoDecoder;
 
 use super::vp9_default_probs::*;
-use super::{addr_hi, plane_layer_base, slot_key, upload_bytes};
+use super::{
+    add_submit_fixup, addr_hi, plane_layer_base, slot_key, upload_bytes,
+    upload_bytes_mapped, SubmitFixup,
+};
 
 /// VP9 superblocks are 64x64 pixels.
 const SB_SIZE: u32 = 64;
@@ -95,10 +100,11 @@ struct PrevFrame {
     wrote_segmentation_map: bool,
 }
 
-/// Session data stored in the opaque `nvk_video_session::rust` pointer.
+/// The session's state of the frames decoded, in the order the decoder
+/// decodes them, which [`FrameFixup`]s keep up to date.
 #[derive(Default, Debug)]
-pub(crate) struct Decoder {
-    /// The frame decoded last, in decode order.
+struct DecodeState {
+    /// The frame decoded last.
     prev: Option<PrevFrame>,
     /// Which of the two segmentation maps the next frame reads, writing the
     /// other.
@@ -108,9 +114,109 @@ pub(crate) struct Decoder {
     col_mv_read: usize,
     /// Frames decoded, which the decoder takes as the picture's index.
     picture_index: u32,
-    /// The frame context the parser saves the previous frame's to, when it
-    /// starts on the next frame.
-    pending_save: Option<u8>,
+}
+
+/// Session data stored in the opaque `nvk_video_session::rust` pointer.
+#[derive(Default, Debug)]
+pub(crate) struct Decoder {
+    state: Arc<Mutex<DecodeState>>,
+}
+
+/// Forgets the frames decoded before, when the command buffer is submitted.
+struct ResetFixup {
+    state: Arc<Mutex<DecodeState>>,
+}
+
+impl SubmitFixup for ResetFixup {
+    fn submit(&mut self) {
+        *self.state.lock().unwrap() = DecodeState::default();
+    }
+}
+
+/// Where the methods of a pass of the decoder over a frame that depend on the
+/// frames decoded before have their data, in the pushbuffer.
+struct PassMethods {
+    picture_index: *mut u32,
+    segment_read: *mut u32,
+    segment_write: *mut u32,
+    col_mv_write: *mut u32,
+    col_mv_read: *mut u32,
+}
+
+/// The parts of a frame's decode depending on the frame decoded before it,
+/// filled in when the command buffer is submitted.
+struct FrameFixup {
+    state: Arc<Mutex<DecodeState>>,
+    /// The frame, as the frame decoded after it needs it.
+    frame: PrevFrame,
+    /// The picture setup, and where it is uploaded.
+    pic: Box<_nvdec_vp9_pic_s>,
+    pic_map: *mut _nvdec_vp9_pic_s,
+    /// The parser setups of each pass, and where they are uploaded.
+    parsers: Vec<(ParserSetup, *mut ParserSetup)>,
+    /// The parser flags of a frame of the size of the previous frame.
+    same_size_flags: u32,
+    /// The methods of each pass.
+    passes: Vec<PassMethods>,
+    /// The two segmentation maps and the two co-located motion vector
+    /// buffers, as the methods take them.
+    seg_maps: [u32; 2],
+    col_mvs: [u32; 2],
+}
+
+impl SubmitFixup for FrameFixup {
+    fn submit(&mut self) {
+        let mut state = self.state.lock().unwrap();
+        let frame = self.frame;
+        let prev = state
+            .prev
+            .filter(|p| p.width == frame.width && p.height == frame.height);
+
+        // The segmentation maps and the co-located motion vectors of the
+        // previous frame are of no use to a frame of another size.
+        match prev {
+            None => {
+                state.seg_map_read = 0;
+                state.col_mv_read = 0;
+            }
+            Some(p) if p.wrote_segmentation_map => state.seg_map_read ^= 1,
+            Some(_) => (),
+        }
+
+        let pic = &mut self.pic;
+        pic.set_resolutionChange(prev.is_none().into());
+        pic.set_prevIsKeyFrame(prev.is_some_and(|p| p.key_frame).into());
+        pic.set_prevShowFrame(prev.is_some_and(|p| p.show_frame).into());
+        let same_size_flags = if prev.is_some() {
+            self.same_size_flags
+        } else {
+            0
+        };
+        // SAFETY: the uploads and the pushbuffer are the command buffer's,
+        // which the GPU doesn't use until it is submitted.
+        unsafe {
+            self.pic_map.write(**pic);
+            for (parser, map) in &self.parsers {
+                map.write(ParserSetup {
+                    flags: parser.flags | same_size_flags,
+                    ..*parser
+                });
+            }
+            let seg_map = state.seg_map_read;
+            let col_mv = state.col_mv_read;
+            for pass in &self.passes {
+                pass.picture_index.write(state.picture_index);
+                pass.segment_read.write(self.seg_maps[seg_map]);
+                pass.segment_write.write(self.seg_maps[seg_map ^ 1]);
+                pass.col_mv_write.write(self.col_mvs[col_mv ^ 1]);
+                pass.col_mv_read.write(self.col_mvs[col_mv]);
+            }
+        }
+
+        state.col_mv_read ^= 1;
+        state.prev = Some(frame);
+        state.picture_index = state.picture_index.wrapping_add(1);
+    }
 }
 
 /// A picture the decoder reads or writes.
@@ -326,19 +432,20 @@ pub extern "C" fn nvk_video_vp9_default_probs(dst: *mut u8, size: usize) {
 }
 
 /// Uploads `value` to the command buffer's upload heap, and returns its GPU
-/// address.
+/// address and where it is mapped.
 fn upload<T>(
     cmd: &mut nvk_cmd_buffer,
     value: &T,
-) -> Result<u64, ffi::VkResult> {
+) -> Result<(u64, *mut T), ffi::VkResult> {
     let size = std::mem::size_of_val(value);
-    unsafe {
-        upload_bytes(
+    let (addr, map) = unsafe {
+        upload_bytes_mapped(
             cmd,
             Some(((value as *const T).cast(), size)),
             size.try_into().unwrap(),
         )
-    }
+    }?;
+    Ok((addr, map.cast()))
 }
 
 impl Decoder {
@@ -356,7 +463,12 @@ impl Decoder {
 
 impl VideoDecoder for Decoder {
     fn reset(&mut self, cmd: &mut nvk_cmd_buffer) {
-        *self = Decoder::default();
+        add_submit_fixup(
+            cmd,
+            Box::new(ResetFixup {
+                state: self.state.clone(),
+            }),
+        );
         // The parser's state of the previous frame goes too, with the frame
         // context it would save.
         let session = unsafe { cmd.state.video.vid.as_ref().unwrap() };
@@ -390,18 +502,6 @@ impl VideoDecoder for Decoder {
         let (width, height) = (dst.width, dst.height);
         let key_frame = std.frame_type == ffi::STD_VIDEO_VP9_FRAME_TYPE_KEY;
         let intra_only = flags.intra_only() != 0;
-        let same_size = self
-            .prev
-            .is_some_and(|p| p.width == width && p.height == height);
-
-        // The segmentation maps and the co-located motion vectors of the
-        // previous frame are of no use to a frame of another size.
-        if !same_size {
-            self.seg_map_read = 0;
-            self.col_mv_read = 0;
-        } else if self.prev.is_some_and(|p| p.wrote_segmentation_map) {
-            self.seg_map_read ^= 1;
-        }
 
         let refs: [Option<Picture>; REFS] = std::array::from_fn(|i| {
             Self::reference(frame_info, vp9.referenceNameSlotIndices[i])
@@ -478,13 +578,9 @@ impl VideoDecoder for Decoder {
         pic.set_errorResilient(
             flags.error_resilient_mode().try_into().unwrap(),
         );
-        pic.set_resolutionChange((!same_size).into());
-        pic.set_prevIsKeyFrame(
-            (same_size && self.prev.is_some_and(|p| p.key_frame)).into(),
-        );
-        pic.set_prevShowFrame(
-            (same_size && self.prev.is_some_and(|p| p.show_frame)).into(),
-        );
+        // What the frame needs of the previous one (resolutionChange,
+        // prevIsKeyFrame and prevShowFrame) is left to the submission: see
+        // FrameFixup.
 
         let sign_bias: [u8; 4] =
             std::array::from_fn(|i| (std.ref_frame_sign_bias_mask >> i) & 1);
@@ -568,7 +664,8 @@ impl VideoDecoder for Decoder {
         // not right the one an intra-only frame resets alone: GA10x's decoder
         // (GSP-RM r570) then writes the first half of the defaults to frame
         // context 2 and the second half to frame context 0, whatever the
-        // frame's. NVK resets that one itself, see reset_context().
+        // frame's. NVK resets that one itself, once the parser is done with
+        // it.
         let parser_reset: u8 = if intra_only && std.reset_frame_context == 3 {
             3
         } else {
@@ -587,11 +684,12 @@ impl VideoDecoder for Decoder {
         if refresh_context {
             parser.flags |= PARSER_REFRESH_CONTEXT;
         }
-        if error_resilient && same_size {
-            parser.flags |= PARSER_ERROR_RESILIENT_SAME_SIZE;
+        let mut same_size_flags = 0;
+        if error_resilient {
+            same_size_flags |= PARSER_ERROR_RESILIENT_SAME_SIZE;
         }
-        if frame_parallel && same_size {
-            parser.flags |= PARSER_FRAME_PARALLEL_SAME_SIZE;
+        if frame_parallel {
+            same_size_flags |= PARSER_FRAME_PARALLEL_SAME_SIZE;
         }
 
         // The size of each tile, a row of tiles after the other.
@@ -611,9 +709,11 @@ impl VideoDecoder for Decoder {
             .next_multiple_of(buf_align);
         let col_mv_size = (max_sbs * u64::from(ffi::NVK_VP9_COL_MV_SB_B))
             .next_multiple_of(buf_align);
-        let seg_map = |i: usize| seg_mv + i as u64 * seg_map_size;
-        let col_mv =
-            |i: usize| seg_mv + 2 * seg_map_size + i as u64 * col_mv_size;
+        let seg_maps: [u32; 2] =
+            std::array::from_fn(|i| addr_hi(seg_mv + i as u64 * seg_map_size));
+        let col_mvs: [u32; 2] = std::array::from_fn(|i| {
+            addr_hi(seg_mv + 2 * seg_map_size + i as u64 * col_mv_size)
+        });
         let intra_top = session.mems[ffi::NVK_VP9_MEM_FILTER as usize].addr;
         let filter = intra_top + u64::from(ffi::NVK_VP9_INTRA_TOP_B);
         let probs = session.mems[ffi::NVK_VP9_MEM_PROBS as usize].addr;
@@ -630,8 +730,7 @@ impl VideoDecoder for Decoder {
         let counters = probs + u64::from(ffi::NVK_VP9_COUNTERS_OFFSET_B);
         let prev_pic = probs + u64::from(ffi::NVK_VP9_PREV_PIC_OFFSET_B);
 
-        let pic_addr = upload(cmd, &pic)?;
-        let parser_addr = upload(cmd, &parser)?;
+        let (pic_addr, pic_map) = upload(cmd, &pic)?;
         let tiles_addr = unsafe {
             upload_bytes(
                 cmd,
@@ -642,160 +741,175 @@ impl VideoDecoder for Decoder {
         // Where the decoder writes the frame's status.
         let status_addr = unsafe { upload_bytes(cmd, None, 512) }?;
 
-        // The methods decoding the frame, with the parser setup and the
-        // probability table the decoder writes the frame's probabilities to.
-        let decode = |parser_addr: u64, frame_probs: u64| {
-            let mut push = Push::new();
+        // Pushes the methods of a pass of the decoder over the frame, with the
+        // parser setup and the probability table the decoder writes the
+        // frame's probabilities to.
+        let decode =
+            |cmd: &mut nvk_cmd_buffer, parser_addr: u64, frame_probs: u64| {
+                let mut push = Push::new();
 
-            push.push_mthd(clc7b0::SetApplicationId {
-                id: clc7b0::SetApplicationIdId::Vp9WithParser,
-            });
-            // NVIDIA's driver sets the codec type field to 1 with VP9_WITH_PARSER,
-            // not to VP9's.
-            push.push_mthd(clc7b0::SetControlParams {
-                codec_type: clc7b0::SetControlParamsCodecType::Mpeg2,
-                gptimer_on: 1,
-                ret_error: 0,
-                err_conceal_on: 1,
-                error_frm_idx: 0,
-                mbtimer_on: 1,
-                ec_intra_frame_using_pslc: 0,
-                ignore_some_fields_crc_check: 0,
-                event_trace_logging_on: 0,
-                all_intra_frame: 0,
-                testrun_env: clc7b0::SetControlParamsTestrunEnv::Trace3DRun,
-                reserved: 0,
-                enable_encrypt: 0,
-                encryptmode: 0,
-            });
-            push.push_mthd(clc7b0::SetDrvPicSetupOffset {
-                offset: addr_hi(pic_addr),
-            });
-            push.push_mthd(clc7b0::SetInBufBaseOffset {
-                offset: addr_hi(src_base),
-            });
-            // Frames without references, key frames, are given the frame itself.
-            for (i, r) in refs.iter().enumerate() {
-                let r = r.as_ref().unwrap_or(&dst);
+                push.push_mthd(clc7b0::SetApplicationId {
+                    id: clc7b0::SetApplicationIdId::Vp9WithParser,
+                });
+                // NVIDIA's driver sets the codec type field to 1 with
+                // VP9_WITH_PARSER, not to VP9's.
+                push.push_mthd(clc7b0::SetControlParams {
+                    codec_type: clc7b0::SetControlParamsCodecType::Mpeg2,
+                    gptimer_on: 1,
+                    ret_error: 0,
+                    err_conceal_on: 1,
+                    error_frm_idx: 0,
+                    mbtimer_on: 1,
+                    ec_intra_frame_using_pslc: 0,
+                    ignore_some_fields_crc_check: 0,
+                    event_trace_logging_on: 0,
+                    all_intra_frame: 0,
+                    testrun_env: clc7b0::SetControlParamsTestrunEnv::Trace3DRun,
+                    reserved: 0,
+                    enable_encrypt: 0,
+                    encryptmode: 0,
+                });
+                push.push_mthd(clc7b0::SetDrvPicSetupOffset {
+                    offset: addr_hi(pic_addr),
+                });
+                push.push_mthd(clc7b0::SetInBufBaseOffset {
+                    offset: addr_hi(src_base),
+                });
+                // Frames without references, key frames, are given the frame
+                // itself.
+                for (i, r) in refs.iter().enumerate() {
+                    let r = r.as_ref().unwrap_or(&dst);
+                    push.push_array_mthd(
+                        i,
+                        clc7b0::SetPictureLumaOffset { offset: r.luma() },
+                    );
+                    push.push_array_mthd(
+                        i,
+                        clc7b0::SetPictureChromaOffset { offset: r.chroma() },
+                    );
+                }
+                push.push_mthd(clc7b0::SetNvdecStatusOffset {
+                    offset: addr_hi(status_addr),
+                });
+                // The methods FrameFixup fills in.
+                let picture_index = push
+                    .push_mthd_patchable(clc7b0::SetPictureIndex { index: 0 });
+                push.push_mthd(clc7b0::Vp9ParserSetPicSetupOffset {
+                    offset: addr_hi(parser_addr),
+                });
+                push.push_mthd(clc7b0::Vp9ParserSetProbTabBufOffset {
+                    offset: addr_hi(probs),
+                });
+                push.push_mthd(clc7b0::Vp9ParserSetPrevPicSetupOffset {
+                    offset: addr_hi(prev_pic),
+                });
+                push.push_mthd(clc7b0::Vp9SetProbTabBufOffset {
+                    offset: addr_hi(frame_probs),
+                });
+                push.push_mthd(clc7b0::Vp9SetCtxCounterBufOffset {
+                    offset: addr_hi(counters),
+                });
+                push.push_mthd(clc7b0::Vp9SetTileSizeBufOffset {
+                    offset: addr_hi(tiles_addr),
+                });
+                let segment_read = push.push_mthd_patchable(
+                    clc7b0::Vp9SetSegmentReadBufOffset { offset: 0 },
+                );
+                let segment_write = push.push_mthd_patchable(
+                    clc7b0::Vp9SetSegmentWriteBufOffset { offset: 0 },
+                );
+                let col_mv_write = push.push_mthd_patchable(
+                    clc7b0::Vp9SetColMvwriteBufOffset { offset: 0 },
+                );
+                let col_mv_read = push.push_mthd_patchable(
+                    clc7b0::Vp9SetColMvreadBufOffset { offset: 0 },
+                );
+                push.push_mthd(clc7b0::Vp9SetFilterBufferOffset {
+                    offset: addr_hi(filter),
+                });
+                push.push_mthd(clc7b0::SetIntraTopBufOffset {
+                    offset: addr_hi(intra_top),
+                });
+                // The picture decoded, after the references.
                 push.push_array_mthd(
-                    i,
-                    clc7b0::SetPictureLumaOffset { offset: r.luma() },
+                    REFS,
+                    clc7b0::SetPictureLumaOffset { offset: dst.luma() },
                 );
                 push.push_array_mthd(
-                    i,
-                    clc7b0::SetPictureChromaOffset { offset: r.chroma() },
+                    REFS,
+                    clc7b0::SetPictureChromaOffset {
+                        offset: dst.chroma(),
+                    },
                 );
-            }
-            push.push_mthd(clc7b0::SetNvdecStatusOffset {
-                offset: addr_hi(status_addr),
-            });
-            push.push_mthd(clc7b0::SetPictureIndex {
-                index: self.picture_index,
-            });
-            push.push_mthd(clc7b0::Vp9ParserSetPicSetupOffset {
-                offset: addr_hi(parser_addr),
-            });
-            push.push_mthd(clc7b0::Vp9ParserSetProbTabBufOffset {
-                offset: addr_hi(probs),
-            });
-            push.push_mthd(clc7b0::Vp9ParserSetPrevPicSetupOffset {
-                offset: addr_hi(prev_pic),
-            });
-            push.push_mthd(clc7b0::Vp9SetProbTabBufOffset {
-                offset: addr_hi(frame_probs),
-            });
-            push.push_mthd(clc7b0::Vp9SetCtxCounterBufOffset {
-                offset: addr_hi(counters),
-            });
-            push.push_mthd(clc7b0::Vp9SetTileSizeBufOffset {
-                offset: addr_hi(tiles_addr),
-            });
-            push.push_mthd(clc7b0::Vp9SetSegmentReadBufOffset {
-                offset: addr_hi(seg_map(self.seg_map_read)),
-            });
-            push.push_mthd(clc7b0::Vp9SetSegmentWriteBufOffset {
-                offset: addr_hi(seg_map(self.seg_map_read ^ 1)),
-            });
-            push.push_mthd(clc7b0::Vp9SetColMvwriteBufOffset {
-                offset: addr_hi(col_mv(self.col_mv_read ^ 1)),
-            });
-            push.push_mthd(clc7b0::Vp9SetColMvreadBufOffset {
-                offset: addr_hi(col_mv(self.col_mv_read)),
-            });
-            push.push_mthd(clc7b0::Vp9SetFilterBufferOffset {
-                offset: addr_hi(filter),
-            });
-            push.push_mthd(clc7b0::SetIntraTopBufOffset {
-                offset: addr_hi(intra_top),
-            });
-            // The picture decoded, after the references.
-            push.push_array_mthd(
-                REFS,
-                clc7b0::SetPictureLumaOffset { offset: dst.luma() },
-            );
-            push.push_array_mthd(
-                REFS,
-                clc7b0::SetPictureChromaOffset {
-                    offset: dst.chroma(),
-                },
-            );
-            push.push_mthd(clc7b0::Execute {
-                notify: clc7b0::ExecuteNotify::Disable,
-                notify_on: clc7b0::ExecuteNotifyOn::End,
-                predication: clc7b0::ExecutePredication::Disable,
-                predication_op: clc7b0::ExecutePredicationOp::EqualZero,
-                awaken: clc7b0::ExecuteAwaken::Disable,
-            });
-            push
-        };
+                push.push_mthd(clc7b0::Execute {
+                    notify: clc7b0::ExecuteNotify::Disable,
+                    notify_on: clc7b0::ExecuteNotifyOn::End,
+                    predication: clc7b0::ExecutePredication::Disable,
+                    predication_op: clc7b0::ExecutePredicationOp::EqualZero,
+                    awaken: clc7b0::ExecuteAwaken::Disable,
+                });
 
-        // The frame context an intra-only frame resets alone: the frame
-        // context the previous frame refreshed is saved when the parser
-        // starts on the next frame (adapted to what the previous frame
-        // decoded), so the defaults have to be written after that, and before
-        // the frame loads frame context 0.
-        let mut reset_after = None;
+                let start = nvk_cmd_buffer_push(cmd, push);
+                let word = |i: usize| unsafe { start.add(i) };
+                PassMethods {
+                    picture_index: word(picture_index),
+                    segment_read: word(segment_read),
+                    segment_write: word(segment_write),
+                    col_mv_write: word(col_mv_write),
+                    col_mv_read: word(col_mv_read),
+                }
+            };
+
+        // The frame context an intra-only frame resets alone. The parser
+        // saves the frame context the previous frame refreshed when it starts
+        // on the next frame (adapted to what the previous frame decoded), so
+        // the defaults have to be written after that, and before the frame
+        // loads frame context 0: a first pass over the frame, which saves
+        // nothing itself, has the parser save it, whichever frame context it
+        // is, which depends on the frame decoded before.
+        let mut parsers = Vec::new();
+        let mut passes = Vec::new();
         if let Some(reset) = reset_context {
-            let reset_addr = table(reset.into());
-            if self.pending_save != Some(reset) {
-                push_write(cmd, reset_addr, &default_probs_bytes());
-            } else if reset != 0 {
-                // The frame doesn't load the frame context it resets.
-                reset_after = Some(reset_addr);
-            } else {
-                // The frame loads the frame context it resets, which the
-                // parser saves the previous frame's to first: a first pass
-                // over the frame, which saves nothing itself, has it do that.
-                let first = ParserSetup {
-                    flags: parser.flags & !PARSER_REFRESH_CONTEXT,
-                    ..parser
-                };
-                let first_addr = upload(cmd, &first)?;
-                nvk_cmd_buffer_push(
-                    cmd,
-                    decode(first_addr, table(ffi::NVK_VP9_CURRENT_PROBS)),
-                );
-                push_write(cmd, reset_addr, &default_probs_bytes());
-            }
+            let first = ParserSetup {
+                flags: parser.flags & !PARSER_REFRESH_CONTEXT,
+                ..parser
+            };
+            let (first_addr, first_map) = upload(cmd, &first)?;
+            parsers.push((first, first_map));
+            passes.push(decode(
+                cmd,
+                first_addr,
+                table(ffi::NVK_VP9_CURRENT_PROBS),
+            ));
+            push_write(cmd, table(reset.into()), &default_probs_bytes());
         }
+        let (parser_addr, parser_map) = upload(cmd, &parser)?;
+        parsers.push((parser, parser_map));
+        passes.push(decode(cmd, parser_addr, frame_probs));
 
-        let push = decode(parser_addr, frame_probs);
-        nvk_cmd_buffer_push(cmd, push);
-        if let Some(reset_addr) = reset_after {
-            push_write(cmd, reset_addr, &default_probs_bytes());
-        }
-
-        self.pending_save = refresh_context.then_some(context_idx);
-        self.col_mv_read ^= 1;
-        self.prev = Some(PrevFrame {
-            width,
-            height,
-            key_frame,
-            show_frame: flags.show_frame() != 0,
-            wrote_segmentation_map: segmentation
-                && seg.is_some_and(|s| s.flags.segmentation_update_map() != 0),
-        });
-        self.picture_index = self.picture_index.wrapping_add(1);
+        add_submit_fixup(
+            cmd,
+            Box::new(FrameFixup {
+                state: self.state.clone(),
+                frame: PrevFrame {
+                    width,
+                    height,
+                    key_frame,
+                    show_frame: flags.show_frame() != 0,
+                    wrote_segmentation_map: segmentation
+                        && seg.is_some_and(|s| {
+                            s.flags.segmentation_update_map() != 0
+                        }),
+                },
+                pic: Box::new(pic),
+                pic_map,
+                parsers,
+                same_size_flags,
+                passes,
+                seg_maps,
+                col_mvs,
+            }),
+        );
 
         Ok(())
     }

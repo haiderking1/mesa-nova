@@ -276,6 +276,11 @@ struct nvk_cmd_buffer {
     */
    struct util_dynarray pushes;
 
+   /** What the video decode commands leave to the submission, owned by Rust
+    * (see nvk_video_cmd_buffer_submit())
+    */
+   void *video_fixups;
+
    uint8_t prev_subc;
 };
 
