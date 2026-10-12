@@ -1161,11 +1161,18 @@ av1_skip_mode_frames(const struct pipe_av1_picture_desc *av1,
    }
 }
 
-/* Copies the picture src to dst, plane by plane. */
+/* Copies the picture src to dst, plane by plane, after the work of the video
+ * context ctx so far.
+ *
+ * The video queue runs no transfers, so the copy context copies: its
+ * submission waits for the video queue's last one, as submissions to another
+ * queue than the last submission's do.
+ */
 static void
-copy_video_buffer(struct pipe_context *pctx, struct pipe_video_buffer *dst,
+copy_video_buffer(struct zink_context *ctx, struct pipe_video_buffer *dst,
                   struct pipe_video_buffer *src)
 {
+   struct zink_screen *screen = zink_screen(ctx->base.screen);
    struct pipe_resource *src_planes[VL_NUM_COMPONENTS] = { 0 };
    struct pipe_resource *dst_planes[VL_NUM_COMPONENTS] = { 0 };
    src->get_resources(src, src_planes);
@@ -1174,6 +1181,10 @@ copy_video_buffer(struct pipe_context *pctx, struct pipe_video_buffer *dst,
    /* The planes of the pictures' size, which chroma planes are a part of. */
    const unsigned width = MIN2(src->width, dst->width);
    const unsigned height = MIN2(src->height, dst->height);
+
+   ctx->base.flush(&ctx->base, NULL, 0);
+   zink_screen_lock_context(screen);
+   struct pipe_context *pctx = &screen->copy_context->base;
    for (unsigned i = 0; i < VL_NUM_COMPONENTS; i++) {
       if (!src_planes[i] || !dst_planes[i])
          continue;
@@ -1187,6 +1198,8 @@ copy_video_buffer(struct pipe_context *pctx, struct pipe_video_buffer *dst,
       pctx->resource_copy_region(pctx, dst_planes[i], 0, 0, 0, 0,
                                  src_planes[i], 0, &box);
    }
+   pctx->flush(pctx, NULL, 0);
+   zink_screen_unlock_context(screen);
 }
 
 static int
@@ -1622,7 +1635,7 @@ zink_end_frame_av1(struct pipe_video_codec *codec,
     * apply the film grain.
     */
    if (apply_grain && !decoder_grain)
-      copy_video_buffer(&ctx->base, av1->film_grain_target, target);
+      copy_video_buffer(ctx, av1->film_grain_target, target);
 
    return 0;
 }
