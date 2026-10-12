@@ -30,7 +30,7 @@ use nvidia_headers::classes::clc7b0::mthd as clc7b0;
 
 use crate::ffi;
 use crate::ffi::{
-    _nvdec_vp9_pic_s, nvdec_vp9EntropyProbs_t, nvk_cmd_buffer, nvk_image,
+    _nvdec_vp9_pic_s, nvdec_vp9EntropyProbs_t, nvk_cmd_buffer,
     StdVideoDecodeVP9PictureInfo, VkVideoDecodeVP9PictureInfoKHR,
 };
 use crate::nvk_cmd_buffer_push;
@@ -39,8 +39,8 @@ use crate::video::decode::VideoDecoder;
 
 use super::vp9_default_probs::*;
 use super::{
-    add_submit_fixup, addr_hi, plane_layer_base, slot_key, upload_bytes,
-    upload_bytes_mapped, SubmitFixup,
+    add_submit_fixup, addr_hi, upload_bytes, upload_bytes_mapped, Picture,
+    SubmitFixup,
 };
 
 /// VP9 superblocks are 64x64 pixels.
@@ -216,41 +216,6 @@ impl SubmitFixup for FrameFixup {
         state.col_mv_read ^= 1;
         state.prev = Some(frame);
         state.picture_index = state.picture_index.wrapping_add(1);
-    }
-}
-
-/// A picture the decoder reads or writes.
-struct Picture {
-    img: *mut nvk_image,
-    layer: u32,
-    width: u32,
-    height: u32,
-}
-
-impl Picture {
-    fn new(res: &ffi::VkVideoPictureResourceInfoKHR) -> Self {
-        let key = slot_key(res);
-        Picture {
-            img: unsafe { (*key.image_view).vk.image as *mut nvk_image },
-            layer: key.layer,
-            width: res.codedExtent.width,
-            height: res.codedExtent.height,
-        }
-    }
-
-    /// The row pitch of `plane` in bytes.
-    fn stride(&self, plane: usize) -> u16 {
-        let pitch =
-            unsafe { (*self.img).planes[plane].nil.levels[0].row_stride_B };
-        pitch.try_into().unwrap()
-    }
-
-    fn luma(&self) -> u32 {
-        plane_layer_base(self.img, 0, self.layer)
-    }
-
-    fn chroma(&self) -> u32 {
-        plane_layer_base(self.img, 1, self.layer)
     }
 }
 
