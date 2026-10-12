@@ -362,7 +362,7 @@ nvk_queue_init_context_state(struct nvk_queue *queue)
    }
 
    if (queue->engines & NVKMD_ENGINE_VDEC) {
-      result = nvk_push_video_decode_state_init(queue, p);
+      result = nvk_push_video_decode_state_init(queue, p, pdev->info.cls_vdec);
       if (result != VK_SUCCESS)
          return result;
    }
