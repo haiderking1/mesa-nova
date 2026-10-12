@@ -198,7 +198,8 @@ nvk_get_image_format_features(const struct nvk_physical_device *pdev,
    const struct nvk_instance *instance = nvk_physical_device_instance(pdev);
    if ((vk_format == VK_FORMAT_G8_B8R8_2PLANE_420_UNORM ||
         (vk_format == VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16 &&
-         nvk_video_av1_enabled(instance, &pdev->info))) &&
+         (nvk_video_vp9_enabled(instance, &pdev->info) ||
+          nvk_video_av1_enabled(instance, &pdev->info)))) &&
        nvk_video_enabled(instance, &pdev->info) &&
        (tiling == VK_IMAGE_TILING_OPTIMAL ||
         (tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT &&

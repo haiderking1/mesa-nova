@@ -338,11 +338,15 @@ nvk_GetPhysicalDeviceVideoCapabilitiesKHR(VkPhysicalDevice physicalDevice,
       if (!pdev->vk.supported_extensions.KHR_video_decode_vp9)
          return VK_ERROR_VIDEO_PROFILE_CODEC_NOT_SUPPORTED_KHR;
 
-      /* Profile 0: 8-bit 4:2:0. */
-      if (vp9_profile->stdProfile != STD_VIDEO_VP9_PROFILE_0)
+      /* Profile 0: 8-bit 4:2:0, and profile 2: 10-bit 4:2:0. */
+      if (vp9_profile->stdProfile != STD_VIDEO_VP9_PROFILE_0 &&
+          vp9_profile->stdProfile != STD_VIDEO_VP9_PROFILE_2)
          return VK_ERROR_VIDEO_PROFILE_OPERATION_NOT_SUPPORTED_KHR;
 
-      if (pVideoProfile->lumaBitDepth != VK_VIDEO_COMPONENT_BIT_DEPTH_8_BIT_KHR)
+      if (pVideoProfile->lumaBitDepth !=
+          (vp9_profile->stdProfile == STD_VIDEO_VP9_PROFILE_0 ?
+           VK_VIDEO_COMPONENT_BIT_DEPTH_8_BIT_KHR :
+           VK_VIDEO_COMPONENT_BIT_DEPTH_10_BIT_KHR))
          return VK_ERROR_VIDEO_PROFILE_FORMAT_NOT_SUPPORTED_KHR;
 
       /* The limits NVIDIA's driver reports for NVDEC on Ampere. */

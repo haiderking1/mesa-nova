@@ -508,7 +508,13 @@ impl VideoDecoder for Decoder {
         pic.set_gob_height((y_log2 - 1).into());
         pic.Vp9BsdCtrlOffset = 12 * filter_rows;
         pic.v1.Vp9FltAboveOffset = 13 * filter_rows;
-        pic.v1.set_bit_depth(8);
+        let color = unsafe { &*std.pColorConfig };
+        pic.v1.set_bit_depth(color.BitDepth.into());
+        // The decoder takes the pictures' pitch in samples, of 2 bytes above 8
+        // bits.
+        let pitch = |p: &Picture, plane: usize| {
+            p.stride(plane) >> u16::from(color.BitDepth > 8)
+        };
 
         let ref_sizes = [
             (
@@ -531,12 +537,12 @@ impl VideoDecoder for Decoder {
             if let Some(r) = r {
                 *w = r.width.try_into().unwrap();
                 *h = r.height.try_into().unwrap();
-                *stride = [r.stride(0), r.stride(1)];
+                *stride = [pitch(r, 0), pitch(r, 1)];
             }
         }
         pic.width = width.try_into().unwrap();
         pic.height = height.try_into().unwrap();
-        pic.framestride = [dst.stride(0), dst.stride(1)];
+        pic.framestride = [pitch(&dst, 0), pitch(&dst, 1)];
 
         pic.set_keyFrame(key_frame.into());
         pic.set_intraOnly(intra_only.into());
