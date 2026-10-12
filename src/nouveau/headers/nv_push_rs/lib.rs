@@ -197,6 +197,22 @@ impl Push {
         self.push_mthd_bits(class_to_subc(M::CLASS), M::ADDR, mthd.to_bits());
     }
 
+    /// Pushes `mthd` with its data in a dword of its own, never in the
+    /// method header, and returns the index of that dword: the data can then
+    /// be changed in the pushed copy, once the push is in a pushbuffer.
+    pub fn push_mthd_patchable<M: Mthd>(&mut self, mthd: M) -> usize {
+        self.last_inc = self.mem.len();
+        let header = MthdHeader::new(
+            MthdType::NInc,
+            class_to_subc(M::CLASS),
+            M::ADDR,
+            1,
+        );
+        self.mem.push(header.into_bits());
+        self.mem.push(mthd.to_bits());
+        self.mem.len() - 1
+    }
+
     pub fn push_mthd_0inc<M: Mthd>(&mut self, mthd: M) {
         assert!(mthd.to_bits() == 0);
 
