@@ -379,7 +379,7 @@ nvk_GetPhysicalDeviceVideoCapabilitiesKHR(VkPhysicalDevice physicalDevice,
       if (!pdev->vk.supported_extensions.KHR_video_decode_av1)
          return VK_ERROR_VIDEO_PROFILE_CODEC_NOT_SUPPORTED_KHR;
 
-      /* Main profile, 8-bit 4:2:0. */
+      /* Main profile: 8-bit and 10-bit 4:2:0. */
       if (av1_profile->stdProfile != STD_VIDEO_AV1_PROFILE_MAIN)
          return VK_ERROR_VIDEO_PROFILE_OPERATION_NOT_SUPPORTED_KHR;
 
@@ -389,7 +389,8 @@ nvk_GetPhysicalDeviceVideoCapabilitiesKHR(VkPhysicalDevice physicalDevice,
       if (av1_profile->filmGrainSupport && dec_caps)
          dec_caps->flags |= VK_VIDEO_DECODE_CAPABILITY_DPB_AND_OUTPUT_DISTINCT_BIT_KHR;
 
-      if (pVideoProfile->lumaBitDepth != VK_VIDEO_COMPONENT_BIT_DEPTH_8_BIT_KHR)
+      if (pVideoProfile->lumaBitDepth != VK_VIDEO_COMPONENT_BIT_DEPTH_8_BIT_KHR &&
+          pVideoProfile->lumaBitDepth != VK_VIDEO_COMPONENT_BIT_DEPTH_10_BIT_KHR)
          return VK_ERROR_VIDEO_PROFILE_FORMAT_NOT_SUPPORTED_KHR;
 
       /* The limits NVIDIA's driver reports for NVDEC on Ampere. */
@@ -451,6 +452,25 @@ nvk_GetPhysicalDeviceVideoFormatPropertiesKHR(VkPhysicalDevice physicalDevice,
    if (video_usage == 0)
       return VK_ERROR_IMAGE_USAGE_NOT_SUPPORTED_KHR;
 
+   /* The pictures of the profiles' bit depth: NV12, or P010 of 10 bits, in
+    * the high bits of 16. The profiles all have to be of the same.
+    */
+   const VkVideoProfileListInfoKHR *profiles =
+      vk_find_struct_const(pVideoFormatInfo->pNext,
+                           VIDEO_PROFILE_LIST_INFO_KHR);
+   VkVideoComponentBitDepthFlagsKHR bit_depth =
+      VK_VIDEO_COMPONENT_BIT_DEPTH_8_BIT_KHR;
+   for (uint32_t i = 0; profiles && i < profiles->profileCount; i++) {
+      const VkVideoProfileInfoKHR *profile = &profiles->pProfiles[i];
+      if (i > 0 && profile->lumaBitDepth != bit_depth)
+         return VK_ERROR_VIDEO_PROFILE_FORMAT_NOT_SUPPORTED_KHR;
+      bit_depth = profile->lumaBitDepth;
+   }
+   const VkFormat format =
+      bit_depth == VK_VIDEO_COMPONENT_BIT_DEPTH_10_BIT_KHR ?
+      VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16 :
+      VK_FORMAT_G8_B8R8_2PLANE_420_UNORM;
+
    /* Optimal images, and images of DRM format modifiers, for the decoded
     * pictures to be shared: those of the block linear modifier the decoder
     * writes (see nil_drm_format_mod_supports_video()).
@@ -461,7 +481,7 @@ nvk_GetPhysicalDeviceVideoFormatPropertiesKHR(VkPhysicalDevice physicalDevice,
    };
    for (unsigned i = 0; i < ARRAY_SIZE(tilings); i++) {
       vk_outarray_append_typed(VkVideoFormatPropertiesKHR, &out, p) {
-         p->format = VK_FORMAT_G8_B8R8_2PLANE_420_UNORM;
+         p->format = format;
          p->imageType = VK_IMAGE_TYPE_2D;
          p->imageTiling = tilings[i];
          /* Report the create flags video images actually support. */
