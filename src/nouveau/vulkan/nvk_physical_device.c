@@ -116,10 +116,11 @@ nvk_get_device_extensions(const struct nvk_instance *instance,
 {
    const bool h264dec = nvk_video_h264_enabled(instance, info);
    const bool vp9dec = nvk_video_vp9_enabled(instance, info);
+   const bool av1dec = nvk_video_av1_enabled(instance, info);
    /* The queue and the maintenance extensions are not codec specific, so
     * they follow whether any decode codec is enabled.
     */
-   const bool video = h264dec || vp9dec;
+   const bool video = h264dec || vp9dec || av1dec;
 
    *ext = (struct vk_device_extension_table) {
       .KHR_8bit_storage = true,
@@ -224,6 +225,7 @@ nvk_get_device_extensions(const struct nvk_instance *instance,
       .KHR_video_queue = video,
       .KHR_video_decode_queue = video,
       .KHR_video_decode_h264 = h264dec,
+      .KHR_video_decode_av1 = av1dec,
       .KHR_video_decode_vp9 = vp9dec,
       .KHR_video_maintenance1 = video,
       .KHR_video_maintenance2 = video,
@@ -1929,6 +1931,9 @@ nvk_GetPhysicalDeviceQueueFamilyProperties2(
                if (pdev->vk.supported_extensions.KHR_video_decode_vp9)
                   p->videoCodecOperations |=
                      VK_VIDEO_CODEC_OPERATION_DECODE_VP9_BIT_KHR;
+               if (pdev->vk.supported_extensions.KHR_video_decode_av1)
+                  p->videoCodecOperations |=
+                     VK_VIDEO_CODEC_OPERATION_DECODE_AV1_BIT_KHR;
                break;
             }
 

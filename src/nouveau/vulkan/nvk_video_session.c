@@ -88,6 +88,25 @@ nvk_CreateVideoSessionKHR(VkDevice _device,
       break;
    }
 
+   case VK_VIDEO_CODEC_OPERATION_DECODE_AV1_BIT_KHR: {
+      const struct nvk_video_av1_mem_layout layout =
+         nvk_video_av1_mem_layout(vid->vk.max_coded.width,
+                                  vid->vk.max_coded.height);
+      vid->mems[NVK_AV1_MEM_MV_SEG] = (struct nvk_vid_mem) {
+         .size_B = layout.mv_seg_mem_B,
+         .align_B = 4096,
+      };
+      vid->mems[NVK_AV1_MEM_FILTER] = (struct nvk_vid_mem) {
+         .size_B = layout.filter_mem_B,
+         .align_B = 4096,
+      };
+      vid->mems[NVK_AV1_MEM_PROBS] = (struct nvk_vid_mem) {
+         .size_B = NVK_AV1_PROBS_MEM_B,
+         .align_B = 4096,
+      };
+      break;
+   }
+
    default:
       vk_video_session_finish(&vid->vk);
       vk_free2(&dev->vk.alloc, pAllocator, vid);
@@ -172,6 +191,51 @@ nvk_video_vp9_init_probs_mem(struct nvk_device *dev,
    return result;
 }
 
+/* Gives an AV1 session its default probability tables, and its segment id
+ * map of zeros, through the upload queue, which the decodes submitted later
+ * wait for.
+ */
+static VkResult
+nvk_video_av1_init_mem(struct nvk_device *dev,
+                       const struct nvk_video_session *vid,
+                       uint32_t bind_index)
+{
+   switch (bind_index) {
+   case NVK_AV1_MEM_PROBS: {
+      const uint32_t size_B = NVK_AV1_DEFAULT_PROBS * NVK_AV1_PROBS_B;
+      uint8_t *data = vk_zalloc(&dev->vk.alloc, size_B, 8,
+                                VK_SYSTEM_ALLOCATION_SCOPE_COMMAND);
+      if (data == NULL)
+         return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+
+      for (unsigned i = 0; i < NVK_AV1_DEFAULT_PROBS; i++) {
+         nvk_video_av1_default_probs(i, data + i * NVK_AV1_PROBS_B,
+                                     NVK_AV1_PROBS_B);
+      }
+
+      VkResult result =
+         nvk_upload_queue_upload(dev, &dev->upload,
+                                 vid->mems[NVK_AV1_MEM_PROBS].addr,
+                                 data, size_B);
+      vk_free(&dev->vk.alloc, data);
+      return result;
+   }
+
+   case NVK_AV1_MEM_MV_SEG: {
+      const struct nvk_video_av1_mem_layout layout =
+         nvk_video_av1_mem_layout(vid->vk.max_coded.width,
+                                  vid->vk.max_coded.height);
+      return nvk_upload_queue_fill(dev, &dev->upload,
+                                   vid->mems[NVK_AV1_MEM_MV_SEG].addr +
+                                   layout.zero_seg_offset_B,
+                                   0, layout.seg_B);
+   }
+
+   default:
+      return VK_SUCCESS;
+   }
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 nvk_BindVideoSessionMemoryKHR(VkDevice _device,
    VkVideoSessionKHR videoSession,
@@ -191,6 +255,13 @@ nvk_BindVideoSessionMemoryKHR(VkDevice _device,
       if (vid->vk.op == VK_VIDEO_CODEC_OPERATION_DECODE_VP9_BIT_KHR &&
           info->memoryBindIndex == NVK_VP9_MEM_PROBS) {
          VkResult result = nvk_video_vp9_init_probs_mem(dev, vid);
+         if (result != VK_SUCCESS)
+            return result;
+      }
+
+      if (vid->vk.op == VK_VIDEO_CODEC_OPERATION_DECODE_AV1_BIT_KHR) {
+         VkResult result =
+            nvk_video_av1_init_mem(dev, vid, info->memoryBindIndex);
          if (result != VK_SUCCESS)
             return result;
       }
@@ -293,6 +364,53 @@ nvk_GetPhysicalDeviceVideoCapabilitiesKHR(VkPhysicalDevice physicalDevice,
              VK_STD_VULKAN_VIDEO_CODEC_VP9_DECODE_EXTENSION_NAME);
       pCapabilities->stdHeaderVersion.specVersion =
          VK_STD_VULKAN_VIDEO_CODEC_VP9_DECODE_SPEC_VERSION;
+      break;
+   }
+
+   case VK_VIDEO_CODEC_OPERATION_DECODE_AV1_BIT_KHR: {
+      VK_FROM_HANDLE(nvk_physical_device, pdev, physicalDevice);
+      const struct VkVideoDecodeAV1ProfileInfoKHR *av1_profile =
+         vk_find_struct_const(pVideoProfile->pNext,
+                              VIDEO_DECODE_AV1_PROFILE_INFO_KHR);
+      struct VkVideoDecodeAV1CapabilitiesKHR *ext =
+         vk_find_struct(pCapabilities->pNext,
+                        VIDEO_DECODE_AV1_CAPABILITIES_KHR);
+
+      if (!pdev->vk.supported_extensions.KHR_video_decode_av1)
+         return VK_ERROR_VIDEO_PROFILE_CODEC_NOT_SUPPORTED_KHR;
+
+      /* Main profile, 8-bit 4:2:0. */
+      if (av1_profile->stdProfile != STD_VIDEO_AV1_PROFILE_MAIN)
+         return VK_ERROR_VIDEO_PROFILE_OPERATION_NOT_SUPPORTED_KHR;
+
+      /* The decoder outputs the frames with their film grain to another
+       * picture than the reconstructed one, which it writes too.
+       */
+      if (av1_profile->filmGrainSupport && dec_caps)
+         dec_caps->flags |= VK_VIDEO_DECODE_CAPABILITY_DPB_AND_OUTPUT_DISTINCT_BIT_KHR;
+
+      if (pVideoProfile->lumaBitDepth != VK_VIDEO_COMPONENT_BIT_DEPTH_8_BIT_KHR)
+         return VK_ERROR_VIDEO_PROFILE_FORMAT_NOT_SUPPORTED_KHR;
+
+      /* The limits NVIDIA's driver reports for NVDEC on Ampere. */
+      pCapabilities->pictureAccessGranularity.width = 16;
+      pCapabilities->pictureAccessGranularity.height = 16;
+      pCapabilities->minCodedExtent.width = 128;
+      pCapabilities->minCodedExtent.height = 128;
+      pCapabilities->maxCodedExtent.width = 8192;
+      pCapabilities->maxCodedExtent.height = 8192;
+      pCapabilities->flags = VK_VIDEO_CAPABILITY_SEPARATE_REFERENCE_IMAGES_BIT_KHR;
+      /* The 8 reference frames, and the picture decoded, which is also its
+       * own reconstructed picture.
+       */
+      pCapabilities->maxDpbSlots = STD_VIDEO_AV1_NUM_REF_FRAMES + 1;
+      pCapabilities->maxActiveReferencePictures =
+         STD_VIDEO_AV1_REFS_PER_FRAME;
+      ext->maxLevel = STD_VIDEO_AV1_LEVEL_6_0;
+      strcpy(pCapabilities->stdHeaderVersion.extensionName,
+             VK_STD_VULKAN_VIDEO_CODEC_AV1_DECODE_EXTENSION_NAME);
+      pCapabilities->stdHeaderVersion.specVersion =
+         VK_STD_VULKAN_VIDEO_CODEC_AV1_DECODE_SPEC_VERSION;
       break;
    }
 

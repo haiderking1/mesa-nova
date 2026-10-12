@@ -7,6 +7,11 @@ use nv_push_rs;
 use nvidia_headers::classes::cl906f::mthd as cl906f;
 use nvidia_headers::Mthd;
 
+mod av1;
+mod av1_default_cdfs;
+mod av1_film_grain;
+mod av1_gaussian;
+mod av1_probs;
 mod h264;
 mod vp9;
 mod vp9_default_probs;
@@ -215,6 +220,9 @@ pub extern "C" fn nvk_video_create_video_session(
     let decoder: Box<dyn VideoDecoder> = match vid.vk.op {
         ffi::VK_VIDEO_CODEC_OPERATION_DECODE_VP9_BIT_KHR => {
             Box::new(vp9::Decoder::default())
+        }
+        ffi::VK_VIDEO_CODEC_OPERATION_DECODE_AV1_BIT_KHR => {
+            Box::new(av1::Decoder::default())
         }
         _ => Box::new(h264::Decoder::default()),
     };
