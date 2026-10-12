@@ -2127,6 +2127,14 @@ zink_resource_create_with_modifiers(struct pipe_screen *pscreen, const struct pi
       res_planes[p] = res_plane;
 
       res_plane->base.b.format = util_format_get_plane_format(templ->format, p);
+      /* Planes are of their own size, which the frontends size surfaces,
+       * framebuffers and copies of them by: the luma plane's size let them
+       * render to and copy chroma planes out of their bounds.
+       */
+      res_plane->base.b.width0 =
+         util_format_get_plane_width(templ->format, p, templ->width0);
+      res_plane->base.b.height0 =
+         util_format_get_plane_height(templ->format, p, templ->height0);
       res_plane->modifiers_count = modifiers_count;
       res_plane->modifiers = mem_dup(modifiers, modifiers_count * sizeof(uint64_t));
       if (p == 1) {
