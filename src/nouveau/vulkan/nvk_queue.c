@@ -365,6 +365,9 @@ nvk_queue_submit_exec(struct nvk_queue *queue,
    for (unsigned i = 0; i < submit->command_buffer_count; i++) {
       struct nvk_cmd_buffer *cmd =
          container_of(submit->command_buffers[i], struct nvk_cmd_buffer, vk);
+      if (cmd->video_fixups != NULL)
+         nvk_video_cmd_buffer_submit(cmd);
+
       result = nvk_queue_exec_cmd_buffer(queue, cmd);
       if (result != VK_SUCCESS)
          return result;
