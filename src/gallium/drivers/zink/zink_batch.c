@@ -926,8 +926,21 @@ zink_end_batch(struct zink_context *ctx)
       ctx->swapchain = NULL;
    }
 
-   if (screen->device_lost)
+   if (screen->device_lost) {
+      /* The batch isn't submitted, which other contexts waiting for it to
+       * be would wait for forever (see zink_batch_usage_unflushed_wait()):
+       * it counts as submitted, as submit_queue() would have it.
+       */
+      while (!bs->fence.batch_id)
+         bs->fence.batch_id = (uint32_t)p_atomic_inc_return(&screen->curr_batch);
+      bs->usage.usage = bs->fence.batch_id;
+      mtx_lock(&bs->usage.mtx);
+      bs->usage.unflushed = false;
+      cnd_broadcast(&bs->usage.flush);
+      mtx_unlock(&bs->usage.mtx);
+      p_atomic_set(&bs->fence.submitted, true);
       return;
+   }
 
    if (ctx->tc) {
       set_foreach(&bs->active_queries, entry)
