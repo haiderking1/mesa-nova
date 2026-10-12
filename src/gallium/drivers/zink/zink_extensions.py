@@ -79,6 +79,9 @@ class Extension:
     # set from vk.xml when the constructed name doesn't match
     features_struct_name   = None
     properties_struct_name = None
+    # the sTypes of the above, when the struct's name isn't derived
+    features_stype_name    = None
+    properties_stype_name  = None
     
 
     # these are specific to zink_instance.py:
@@ -179,6 +182,11 @@ class Extension:
     # e.g. VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT
     # for VK_EXT_transform_feedback and struct="FEATURES"
     def stype(self, struct: str):
+        if struct == "FEATURES" and self.features_stype_name:
+            return self.features_stype_name
+        if struct == "PROPERTIES" and self.properties_stype_name:
+            return self.properties_stype_name
+
         return ("VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_" 
                 + self.pure_name_in_snake_uppercase()
                 + '_' + struct + '_' 
@@ -233,9 +241,11 @@ class ExtensionRegistryEntry:
     instance_commands = None
     constants         = None
     features_struct   = None
+    features_stype    = None
     features_fields   = None
     features_promoted = False
     properties_struct = None
+    properties_stype  = None
     properties_fields = None
     properties_promoted = False
     # if the property field requires dynamic allocated arrays, double-loading is
@@ -350,7 +360,9 @@ class ExtensionRegistry:
 
                 for field in vkxml.findall("./types/type[@name='{}']/member".format(struct_name)):
                     field_name = field.find("name").text
-                    
+
+                    if field_name == "sType":
+                        entry.features_stype = field.get("values")
                     # we ignore sType and pNext since they are irrelevant
                     if field_name not in ["sType", "pNext"]:
                         entry.features_fields.append(field_name)
@@ -371,6 +383,9 @@ class ExtensionRegistry:
 
                     field_name = field.find("name").text
                     field_type = field.find("./type")
+
+                    if field_name == "sType":
+                        entry.properties_stype = field.get("values")
 
                     field_len = None
                     if field_type.tail.strip() == "*":

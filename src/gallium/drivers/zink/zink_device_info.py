@@ -986,6 +986,7 @@ if __name__ == "__main__":
                 print("The extension {} does not provide a features struct.".format(ext.name))
             elif ext.physical_device_struct("Features") != entry.features_struct:
                 ext.features_struct_name = entry.features_struct
+                ext.features_stype_name = entry.features_stype
             ext.features_promoted = latest_entry.features_promoted
 
         if ext.has_properties:
@@ -994,6 +995,7 @@ if __name__ == "__main__":
                 print("The extension {} does not provide a properties struct.".format(ext.name))
             elif ext.physical_device_struct("Properties") != entry.properties_struct:
                 ext.properties_struct_name = entry.properties_struct
+                ext.properties_stype_name = entry.properties_stype
             ext.properties_promoted = latest_entry.properties_promoted
             ext.needs_double_load = latest_entry.needs_double_load
 
