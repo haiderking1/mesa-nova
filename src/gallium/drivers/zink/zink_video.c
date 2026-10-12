@@ -444,7 +444,12 @@ create_surf(struct zink_video_codec *zvc,
    psurf.format = target->buffer_format;
    VkImageViewCreateInfo ivci = create_ivci(screen, luma, &psurf, PIPE_TEXTURE_2D);
    ivci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+   /* The view only decodes: the surface's other usage (sampling and
+    * rendering) is its planes' views', which the multi-planar format of this
+    * one doesn't have.
+    */
    VkImageViewUsageCreateInfo usage_info = video_view_usage(luma);
+   usage_info.pNext = ivci.pNext;
    ivci.pNext = &usage_info;
 
    VKSCR(CreateImageView)(screen->dev, &ivci, NULL, &surf->resource.imageViewBinding);

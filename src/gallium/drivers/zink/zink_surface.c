@@ -116,11 +116,20 @@ apply_view_usage_for_format(struct zink_screen *screen, struct pipe_resource *pr
                                 zink_get_format_props(screen, format)->linearTilingFeatures :
                                 zink_get_format_props(screen, format)->optimalTilingFeatures;
    uint64_t attachment = (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT);
-   uint64_t video = (VK_IMAGE_USAGE_VIDEO_DECODE_DST_BIT_KHR | VK_IMAGE_USAGE_VIDEO_DECODE_DPB_BIT_KHR);
-   bool is_video_plane = (res->obj->vkusage & video) && util_format_get_num_planes(format) == 1;
-   usage_info->usage = res->obj->vkusage;
+   /* video coding uses views of its own (zink_video.c), and these views'
+    * formats (the planes' of video images) can't do it
+    */
+   const VkImageUsageFlags video = VK_IMAGE_USAGE_VIDEO_DECODE_DST_BIT_KHR |
+                                   VK_IMAGE_USAGE_VIDEO_DECODE_SRC_BIT_KHR |
+                                   VK_IMAGE_USAGE_VIDEO_DECODE_DPB_BIT_KHR |
+                                   VK_IMAGE_USAGE_VIDEO_ENCODE_DST_BIT_KHR |
+                                   VK_IMAGE_USAGE_VIDEO_ENCODE_SRC_BIT_KHR |
+                                   VK_IMAGE_USAGE_VIDEO_ENCODE_DPB_BIT_KHR;
+   usage_info->usage = res->obj->vkusage & ~video;
    if (res->obj->modifier_aspect) {
-      feats = res->obj->vkfeats;
+      /* with EXTENDED_USAGE, views have the features of their own format */
+      if (!(res->obj->vkflags & VK_IMAGE_CREATE_EXTENDED_USAGE_BIT))
+         feats = res->obj->vkfeats;
       /* intersect format features for current modifier */
       for (unsigned i = 0; i < screen->modifier_props[format].drmFormatModifierCount; i++) {
          if (res->obj->modifier == screen->modifier_props[format].pDrmFormatModifierProperties[i].drmFormatModifier)
@@ -128,13 +137,9 @@ apply_view_usage_for_format(struct zink_screen *screen, struct pipe_resource *pr
       }
    }
    /* if the format features don't support framebuffer attachment, use VkImageViewUsageCreateInfo to remove it */
-   bool no_attachment = (res->obj->vkusage & attachment) &&
-                        !(feats & (VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT));
-   if (no_attachment)
+   if (!(feats & (VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT)))
       usage_info->usage &= ~attachment;
-   if (is_video_plane)
-      usage_info->usage &= ~video;
-   ivci->pNext = no_attachment || is_video_plane ? usage_info : NULL;
+   ivci->pNext = usage_info->usage != res->obj->vkusage ? usage_info : NULL;
 }
 
 static struct zink_surface *

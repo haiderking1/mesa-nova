@@ -485,6 +485,11 @@ get_image_usage_for_feats(struct zink_screen *screen, VkFormatFeatureFlags2 feat
 
    if (bind & ZINK_BIND_VIDEO) {
       usage |= get_video_image_usage(templ);
+      /* and render to their planes, which planar formats allow with
+       * EXTENDED_USAGE (see init_ici())
+       */
+      if ((bind & PIPE_BIND_RENDER_TARGET) && (feats & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT))
+         usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
    } else if (bind & PIPE_BIND_RENDER_TARGET) {
       if (feats & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) {
          usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
@@ -761,6 +766,22 @@ find_good_mod(struct zink_screen *screen, VkImageCreateInfo *ici, const struct p
       if (can_disjoint(screen, templ, bind, feats))
          try_flags |= VK_IMAGE_CREATE_DISJOINT_BIT;
 
+      /* With EXTENDED_USAGE, the usage is checked against the formats of
+       * the image's views instead (the planes' of planar formats), and the
+       * driver checks it: fall back to the format's own usage if it can't.
+       */
+      if (try_flags & VK_IMAGE_CREATE_EXTENDED_USAGE_BIT) {
+         VkImageUsageFlags usage = get_image_usage_for_feats(screen, UINT32_MAX, templ, bind, &need_extended);
+         assert(!need_extended);
+         if (try_usage_mutable(screen, ici, usage, modifiers[i])) {
+            found = true;
+            *out_mod = modifiers[i];
+            *out_usage = ici->usage;
+            *out_flags = try_flags;
+            continue;
+         }
+      }
+
       VkImageUsageFlags usage = get_image_usage_for_feats(screen, feats, templ, bind, &need_extended);
       add_2d_view_flag(screen, templ, usage, &try_flags);
       ici->flags = try_flags;
@@ -969,9 +990,15 @@ init_ici(struct zink_screen *screen, VkImageCreateInfo *ici, const struct pipe_r
              !(fprop->imageCreateFlags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT))
             continue;
          VkImageUsageFlags transfer = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+         /* The usage the image has only through the formats of its views:
+          * transfers the video profiles don't allow it, and rendering to the
+          * planes of planar formats (video processing does).
+          */
          video_extended = (templ->flags & ZINK_RESOURCE_FLAG_VIDEO_OUTPUT) &&
                           (fprop->imageCreateFlags & VK_IMAGE_CREATE_EXTENDED_USAGE_BIT) &&
-                          (fprop->imageUsageFlags & transfer) != transfer;
+                          ((fprop->imageUsageFlags & transfer) != transfer ||
+                           ((bind & PIPE_BIND_RENDER_TARGET) &&
+                            util_format_get_num_planes(templ->format) > 1));
          found = true;
          break;
       }
