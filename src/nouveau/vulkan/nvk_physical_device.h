@@ -117,13 +117,26 @@ nvk_video_vp9_enabled(const struct nvk_instance *instance,
           info->cls_vdec >= NVC7B0_VIDEO_DECODER;
 }
 
+/* Whether AV1 video decode is enabled: video is available, the codec is built
+ * in, and the decoder decodes AV1, which it does from Ampere on
+ * (NVC7B0_VIDEO_DECODER).
+ */
+static inline bool
+nvk_video_av1_enabled(const struct nvk_instance *instance,
+                      const struct nv_device_info *info)
+{
+   return nvk_video_available(instance, info) && VIDEO_CODEC_AV1DEC &&
+          info->cls_vdec >= NVC7B0_VIDEO_DECODER;
+}
+
 /* Whether any video decode codec is enabled. */
 static inline bool
 nvk_video_enabled(const struct nvk_instance *instance,
                   const struct nv_device_info *info)
 {
    return nvk_video_h264_enabled(instance, info) ||
-          nvk_video_vp9_enabled(instance, info);
+          nvk_video_vp9_enabled(instance, info) ||
+          nvk_video_av1_enabled(instance, info);
 }
 
 VkResult nvk_create_drm_physical_device(struct vk_instance *vk_instance,
