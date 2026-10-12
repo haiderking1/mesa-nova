@@ -26,9 +26,13 @@ unsafe fn nv_push_append_push(p: *mut ffi::nv_push, push: Push) {
     }
 }
 
-fn nvk_cmd_buffer_push(cmd: &mut ffi::nvk_cmd_buffer, push: Push) {
+/// Appends `push` to the command buffer, and returns where its copy starts in
+/// the pushbuffer.
+fn nvk_cmd_buffer_push(cmd: &mut ffi::nvk_cmd_buffer, push: Push) -> *mut u32 {
     unsafe {
         let p = ffi::nvk_cmd_buffer_push(cmd, push.len().try_into().unwrap());
+        let start = (*p).end;
         nv_push_append_push(p, push);
+        start
     }
 }

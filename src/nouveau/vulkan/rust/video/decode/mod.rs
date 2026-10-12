@@ -18,6 +18,15 @@ unsafe fn upload_bytes(
     data: Option<(*const u8, usize)>,
     size: u32,
 ) -> Result<u64, ffi::VkResult> {
+    unsafe { upload_bytes_mapped(cmd, data, size) }.map(|(addr, _)| addr)
+}
+
+/// [`upload_bytes`], which also returns where the allocation is mapped.
+unsafe fn upload_bytes_mapped(
+    cmd: &mut nvk_cmd_buffer,
+    data: Option<(*const u8, usize)>,
+    size: u32,
+) -> Result<(u64, *mut u8), ffi::VkResult> {
     let mut ptr = std::ptr::null_mut();
     let mut addr = 0;
     unsafe {
@@ -35,7 +44,61 @@ unsafe fn upload_bytes(
             std::ptr::copy_nonoverlapping(src, ptr as *mut u8, len);
         }
     }
-    Ok(addr)
+    Ok((addr, ptr as *mut u8))
+}
+
+/// What a decode needs of the frames decoded before it, in the order the
+/// decoder executes them: command buffers may be recorded in another order
+/// than they are submitted in, so the methods and setups depending on it are
+/// filled in at submission, as submissions execute in the order they are made.
+///
+/// They are filled in in the command buffer's own memory, which a command
+/// buffer submitted again while it is pending (with
+/// `VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT`) has the GPU read meanwhile.
+pub(crate) trait SubmitFixup {
+    /// Fills in what the command buffer leaves to its submission, from the
+    /// session's state, and updates that state.
+    fn submit(&mut self);
+}
+
+/// The fixups of a command buffer, in the order it recorded them, which
+/// `nvk_cmd_buffer::video_fixups` owns.
+#[derive(Default)]
+struct CmdFixups {
+    fixups: Vec<Box<dyn SubmitFixup>>,
+}
+
+/// Adds `fixup` to the ones applied when `cmd` is submitted.
+fn add_submit_fixup(cmd: &mut nvk_cmd_buffer, fixup: Box<dyn SubmitFixup>) {
+    if cmd.video_fixups.is_null() {
+        cmd.video_fixups = Box::into_raw(Box::new(CmdFixups::default())).cast();
+    }
+    let fixups = unsafe { &mut *(cmd.video_fixups as *mut CmdFixups) };
+    fixups.fixups.push(fixup);
+}
+
+/// Applies the fixups of a command buffer being submitted.
+#[unsafe(no_mangle)]
+pub extern "C" fn nvk_video_cmd_buffer_submit(cmd: &mut nvk_cmd_buffer) {
+    // SAFETY: a command buffer isn't recorded, reset or freed while it is
+    // submitted.
+    let Some(fixups) =
+        (unsafe { (cmd.video_fixups as *mut CmdFixups).as_mut() })
+    else {
+        return;
+    };
+    for fixup in &mut fixups.fixups {
+        fixup.submit();
+    }
+}
+
+/// Frees the fixups of a command buffer being reset or destroyed.
+#[unsafe(no_mangle)]
+pub extern "C" fn nvk_video_cmd_buffer_reset(cmd: &mut nvk_cmd_buffer) {
+    if !cmd.video_fixups.is_null() {
+        drop(unsafe { Box::from_raw(cmd.video_fixups as *mut CmdFixups) });
+        cmd.video_fixups = std::ptr::null_mut();
+    }
 }
 
 /// Identifies a DPB picture.
