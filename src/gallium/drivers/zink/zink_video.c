@@ -1170,13 +1170,19 @@ copy_video_buffer(struct pipe_context *pctx, struct pipe_video_buffer *dst,
    src->get_resources(src, src_planes);
    dst->get_resources(dst, dst_planes);
 
+   /* The planes of the pictures' size, which chroma planes are a part of. */
+   const unsigned width = MIN2(src->width, dst->width);
+   const unsigned height = MIN2(src->height, dst->height);
    for (unsigned i = 0; i < VL_NUM_COMPONENTS; i++) {
       if (!src_planes[i] || !dst_planes[i])
          continue;
 
+      unsigned w = width, h = height;
+      vl_video_buffer_adjust_size(&w, &h, i,
+                                  pipe_format_to_chroma_format(src->buffer_format),
+                                  false);
       struct pipe_box box;
-      u_box_3d(0, 0, 0, MIN2(src_planes[i]->width0, dst_planes[i]->width0),
-               MIN2(src_planes[i]->height0, dst_planes[i]->height0), 1, &box);
+      u_box_3d(0, 0, 0, w, h, 1, &box);
       pctx->resource_copy_region(pctx, dst_planes[i], 0, 0, 0, 0,
                                  src_planes[i], 0, &box);
    }
