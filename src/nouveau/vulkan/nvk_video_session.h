@@ -10,6 +10,48 @@
 
 #include "vulkan/runtime/vk_video.h"
 
+/* The memory of VP9 sessions, by binding.
+ *
+ * NVK_VP9_MEM_SEG_MV: the segmentation maps and the co-located motion
+ * vectors of the current and the previous picture.
+ *
+ * NVK_VP9_MEM_FILTER: the intra prediction top line, then the loop filter
+ * buffer.
+ *
+ * NVK_VP9_MEM_PROBS: the probability tables (the 4 frame contexts, the
+ * defaults the decoder resets them from, and the current frame's), the symbol
+ * counters the decoder adapts them with, and the decoder's state of the
+ * previous picture.
+ */
+enum nvk_vp9_mem {
+   NVK_VP9_MEM_SEG_MV,
+   NVK_VP9_MEM_FILTER,
+   NVK_VP9_MEM_PROBS,
+};
+
+/* Bytes per 64x64 superblock of a segmentation map. */
+#define NVK_VP9_SEG_MAP_SB_B 32
+/* Bytes per 64x64 superblock of co-located motion vectors. */
+#define NVK_VP9_COL_MV_SB_B 1024
+/* Bytes of the intra prediction top line, before the loop filter buffer. */
+#define NVK_VP9_INTRA_TOP_B 0x10000
+/* Bytes of a probability table: nvdec_vp9EntropyProbs_t, 256-byte aligned. */
+#define NVK_VP9_PROBS_B 0xf00
+/* Probability tables: the 4 frame contexts, the defaults, and the current
+ * frame's, which the parser leaves for the decoder unless it saves them to
+ * the frame context as they are.
+ */
+#define NVK_VP9_PROBS_COUNT 6
+#define NVK_VP9_DEFAULT_PROBS 4
+#define NVK_VP9_CURRENT_PROBS 5
+/* Bytes of the symbol counters: nvdec_vp9EntropyCounts_t, 256-byte aligned. */
+#define NVK_VP9_COUNTERS_B 0x3400
+/* Bytes of the decoder's state of the previous picture. */
+#define NVK_VP9_PREV_PIC_B 0x200
+#define NVK_VP9_COUNTERS_OFFSET_B (NVK_VP9_PROBS_COUNT * NVK_VP9_PROBS_B)
+#define NVK_VP9_PREV_PIC_OFFSET_B (NVK_VP9_COUNTERS_OFFSET_B + NVK_VP9_COUNTERS_B)
+#define NVK_VP9_PROBS_MEM_B (NVK_VP9_PREV_PIC_OFFSET_B + NVK_VP9_PREV_PIC_B)
+
 struct nvk_vid_mem {
    uint64_t size_B;
    uint32_t align_B;
