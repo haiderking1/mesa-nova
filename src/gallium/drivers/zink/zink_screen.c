@@ -3029,6 +3029,10 @@ zink_get_video_param(struct pipe_screen *screen,
    switch (param) {
    case PIPE_VIDEO_CAP_SUPPORTED:
       return true;
+   case PIPE_VIDEO_CAP_MIN_WIDTH:
+      return caps_info.caps.minCodedExtent.width;
+   case PIPE_VIDEO_CAP_MIN_HEIGHT:
+      return caps_info.caps.minCodedExtent.height;
    case PIPE_VIDEO_CAP_MAX_WIDTH:
       return caps_info.caps.maxCodedExtent.width;
    case PIPE_VIDEO_CAP_MAX_HEIGHT:
