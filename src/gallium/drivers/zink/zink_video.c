@@ -384,6 +384,9 @@ convert_pps_sps(struct pipe_picture_desc *picture,
    vsps->pic_height_in_map_units_minus1 = sps->pic_height_in_mbs_minus1;
 }
 
+/* The serial of the last picture data created */
+static uint64_t surf_serial;
+
 static struct zink_video_surf_data *
 create_surf(struct zink_video_codec *zvc,
             struct pipe_video_buffer *target,
@@ -394,6 +397,7 @@ create_surf(struct zink_video_codec *zvc,
    struct zink_video_surf_data *surf = calloc(sizeof(*surf), 1);
 
    surf->screen = screen;
+   surf->serial = p_atomic_inc_return(&surf_serial);
    surf->resource.sType = VK_STRUCTURE_TYPE_VIDEO_PICTURE_RESOURCE_INFO_KHR;
    surf->resource.pNext = NULL;
    surf->resource.codedExtent.width = target->width;
@@ -781,16 +785,27 @@ video_buffer_surf(struct zink_video_codec *zvc, struct pipe_video_buffer *buf)
    return surf;
 }
 
-/* Gives a free DPB slot to the picture buf. */
+/* Whether a DPB slot holds the picture surf. */
+static bool
+in_dpb(const struct zink_video_codec *zvc,
+       const struct zink_video_surf_data *surf)
+{
+   for (unsigned i = 0; surf && i < ARRAY_SIZE(zvc->dpb_pics); i++) {
+      if (zvc->dpb_pics[i] == surf->serial)
+         return true;
+   }
+   return false;
+}
+
+/* Gives a free DPB slot to the picture surf. */
 static void
-take_dpb_slot(struct zink_video_codec *zvc, struct pipe_video_buffer *buf,
-              struct zink_video_surf_data *surf)
+take_dpb_slot(struct zink_video_codec *zvc, struct zink_video_surf_data *surf)
 {
    unsigned slot = 0;
-   while (slot < zvc->max_dpb_slots - 1 && zvc->render_pic_list[slot])
+   while (slot < zvc->max_dpb_slots - 1 && zvc->dpb_pics[slot])
       slot++;
-   assert(!zvc->render_pic_list[slot]);
-   zvc->render_pic_list[slot] = buf;
+   assert(!zvc->dpb_pics[slot]);
+   zvc->dpb_pics[slot] = surf->serial;
    surf->dpb_index = slot;
 }
 
@@ -801,12 +816,15 @@ static struct zink_video_surf_data *
 assign_dpb_slots(struct zink_video_codec *zvc, struct pipe_video_buffer *target,
                  struct pipe_video_buffer *const *refs, unsigned num_refs)
 {
-   for (unsigned i = 0; i < ARRAY_SIZE(zvc->render_pic_list); i++) {
+   for (unsigned i = 0; i < ARRAY_SIZE(zvc->dpb_pics); i++) {
       bool held = false;
-      for (unsigned j = 0; j < num_refs; j++)
-         held |= refs[j] && zvc->render_pic_list[i] == refs[j];
+      for (unsigned j = 0; j < num_refs; j++) {
+         const struct zink_video_surf_data *rsurf =
+            refs[j] ? picture_data(refs[j]) : NULL;
+         held |= rsurf && zvc->dpb_pics[i] == rsurf->serial;
+      }
       if (!held)
-         zvc->render_pic_list[i] = NULL;
+         zvc->dpb_pics[i] = 0;
    }
 
    /* Another codec's pictures are in no DPB slot of this one yet: with
@@ -815,19 +833,13 @@ assign_dpb_slots(struct zink_video_codec *zvc, struct pipe_video_buffer *target,
    if (zvc->coincide_dpb) {
       for (unsigned j = 0; j < num_refs; j++) {
          struct zink_video_surf_data *rsurf = refs[j] ? picture_data(refs[j]) : NULL;
-         if (!rsurf)
-            continue;
-
-         bool listed = false;
-         for (unsigned i = 0; i < ARRAY_SIZE(zvc->render_pic_list); i++)
-            listed |= zvc->render_pic_list[i] == refs[j];
-         if (!listed)
-            take_dpb_slot(zvc, refs[j], rsurf);
+         if (rsurf && !in_dpb(zvc, rsurf))
+            take_dpb_slot(zvc, rsurf);
       }
    }
 
    struct zink_video_surf_data *surf = video_buffer_surf(zvc, target);
-   take_dpb_slot(zvc, target, surf);
+   take_dpb_slot(zvc, surf);
    return surf;
 }
 
@@ -884,10 +896,7 @@ zink_end_frame_vp9(struct pipe_video_codec *codec,
          continue;
 
       struct zink_video_surf_data *rsurf = picture_data(vp9->ref[ref_frames[i]]);
-      bool slotted = false;
-      for (unsigned j = 0; rsurf && j < ARRAY_SIZE(zvc->render_pic_list); j++)
-         slotted |= zvc->render_pic_list[j] == vp9->ref[ref_frames[i]];
-      if (!slotted)
+      if (!in_dpb(zvc, rsurf))
          continue;
       ref_surfs[i] = rsurf;
       vpi.referenceNameSlotIndices[i] = rsurf->dpb_index;
@@ -1269,10 +1278,7 @@ zink_end_frame_av1(struct pipe_video_codec *codec,
          continue;
 
       struct zink_video_surf_data *rsurf = picture_data(ref);
-      bool slotted = false;
-      for (unsigned j = 0; rsurf && j < ARRAY_SIZE(zvc->render_pic_list); j++)
-         slotted |= zvc->render_pic_list[j] == ref;
-      if (!slotted)
+      if (!in_dpb(zvc, rsurf))
          continue;
       ref_surfs[i] = rsurf;
       avpi.referenceNameSlotIndices[i] = rsurf->dpb_index;

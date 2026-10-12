@@ -64,6 +64,11 @@ struct zink_video_codec {
    size_t srcbuf_align;
    size_t srcbuf_offset_align;
    void *render_pic_list[17];
+   /* The pictures in the DPB slots, by their serial, for VP9 and AV1: a
+    * picture may be destroyed while the codec lives on, and another one
+    * created at its address.
+    */
+   uint64_t dpb_pics[17];
    /* for separate dpb/dst storage */
    struct pipe_resource *dpb_res[17];
    VkVideoPictureResourceInfoKHR dpb_resources[17];
@@ -72,6 +77,8 @@ struct zink_video_codec {
 struct zink_video_surf_data {
    VkVideoPictureResourceInfoKHR resource;
    struct zink_screen *screen;
+   /* Unique to the picture, never 0 */
+   uint64_t serial;
    uint32_t dpb_index;
    /* What decoding AV1 frames referencing the frame decoded to the picture
     * needs of it.
