@@ -17,6 +17,22 @@ macro_rules! vk_find_struct_const(
 
             unsafe { *s }
         }
+    };
+    // For the structures whose names the one of their type doesn't give, such
+    // as VkVideoDecodeVP9PictureInfoKHR: the type is given.
+    ($p:expr, $s:ident, $vendor:ident, $t:ty) => {
+        {
+            let s = unsafe {
+                paste::paste! {
+                    crate::ffi::__vk_find_struct(
+                        $p as *mut _,
+                        crate::ffi::[<VK_STRUCTURE_TYPE_ $s _ $vendor>]
+                    ) as *const $t
+                }
+            };
+
+            unsafe { *s }
+        }
     }
 );
 pub(crate) use vk_find_struct_const;

@@ -10,6 +10,7 @@
 #include "nvk_debug.h"
 #include "nvk_instance.h"
 #include "nv_device_info.h"
+#include "clc7b0.h"
 
 #include "vk_physical_device.h"
 #include "vk_sync.h"
@@ -82,15 +83,47 @@ nvk_physical_device_instance(const struct nvk_physical_device *pdev)
    return (struct nvk_instance *)pdev->vk.instance;
 }
 
-/* Whether H.264 video decode is enabled: the hardware has NVDEC, the codec
- * is built in, and the user opted in via NVK_EXPERIMENTAL=video.
+/* Whether video decode may be enabled at all: the hardware has NVDEC and the
+ * user opted in via NVK_EXPERIMENTAL=video.
  */
+static inline bool
+nvk_video_available(const struct nvk_instance *instance,
+                    const struct nv_device_info *info)
+{
+   return (instance->experimental_flags & NVK_EXPERIMENTAL_VIDEO) &&
+          info->has_video;
+}
+
+/* Whether H.264 video decode is enabled: video is available and the codec is
+ * built in.
+ */
+static inline bool
+nvk_video_h264_enabled(const struct nvk_instance *instance,
+                       const struct nv_device_info *info)
+{
+   return nvk_video_available(instance, info) && VIDEO_CODEC_H264DEC;
+}
+
+/* Whether VP9 video decode is enabled: video is available, the codec is built
+ * in, and the decoder parses VP9's compressed header and adapts its
+ * probabilities itself, which it does from Ampere on (the VP9_PARSER methods
+ * of NVC7B0_VIDEO_DECODER).
+ */
+static inline bool
+nvk_video_vp9_enabled(const struct nvk_instance *instance,
+                      const struct nv_device_info *info)
+{
+   return nvk_video_available(instance, info) && VIDEO_CODEC_VP9DEC &&
+          info->cls_vdec >= NVC7B0_VIDEO_DECODER;
+}
+
+/* Whether any video decode codec is enabled. */
 static inline bool
 nvk_video_enabled(const struct nvk_instance *instance,
                   const struct nv_device_info *info)
 {
-   return (instance->experimental_flags & NVK_EXPERIMENTAL_VIDEO) &&
-          info->has_video && VIDEO_CODEC_H264DEC;
+   return nvk_video_h264_enabled(instance, info) ||
+          nvk_video_vp9_enabled(instance, info);
 }
 
 VkResult nvk_create_drm_physical_device(struct vk_instance *vk_instance,

@@ -11,14 +11,16 @@ use nvidia_headers::classes::clc5b0::mthd as clc5b0;
 
 use crate::ffi;
 use crate::ffi::{
-    _nvdec_h264_pic_s, nvk_cmd_buffer, nvk_image, nvk_image_view,
+    _nvdec_h264_pic_s, nvk_cmd_buffer, nvk_image,
     StdVideoDecodeH264PictureInfo, StdVideoH264SequenceParameterSet,
-    VkVideoBeginCodingInfoKHR, VkVideoReferenceSlotInfoKHR, VK_SUCCESS,
+    VkVideoBeginCodingInfoKHR, VkVideoReferenceSlotInfoKHR,
 };
 use crate::nvk_cmd_buffer_push;
 use crate::util::vk_find_struct_const;
 use crate::video::align_u32;
 use crate::video::decode::VideoDecoder;
+
+use super::{addr_hi, plane_layer_base, slot_key, upload_bytes, SlotKey};
 
 /// The type of picture being decoded.
 #[derive(Debug, Default, Clone, Copy)]
@@ -77,33 +79,6 @@ struct GpuBufferAddresses {
     mbstatus: u64,
 }
 
-/// Suballocate `size` upload-heap bytes (256-byte aligned) and, if `data` is
-/// given, copy it in. Returns the GPU address of the allocation.
-unsafe fn upload_bytes(
-    cmd: &mut nvk_cmd_buffer,
-    data: Option<(*const u8, usize)>,
-    size: u32,
-) -> Result<u64, ffi::VkResult> {
-    let mut ptr = std::ptr::null_mut();
-    let mut addr = 0;
-    unsafe {
-        let res = ffi::nvk_cmd_buffer_upload_alloc(
-            cmd,
-            size,
-            256,
-            &mut addr,
-            &mut ptr as *mut *mut _ as *mut *mut std::ffi::c_void,
-        );
-        if res != VK_SUCCESS {
-            return Err(res);
-        }
-        if let Some((src, len)) = data {
-            std::ptr::copy_nonoverlapping(src, ptr as *mut u8, len);
-        }
-    }
-    Ok(addr)
-}
-
 /// Upload the parameters to the GPU.
 fn upload_to_the_gpu(
     cmd: &mut nvk_cmd_buffer,
@@ -142,55 +117,6 @@ fn upload_to_the_gpu(
         slice_offsets: slice_offsets_address,
         mbstatus: mbstatus_address,
     })
-}
-
-/// Identifies a DPB picture.
-///
-/// With "separated" DPB each picture has its own image view (always array layer
-/// 0); with "layered" DPB a single array image view backs every picture and the
-/// array layer selects the picture. Keying on the image view alone therefore
-/// collides in the layered case, so the array layer is part of the key. Two
-/// video picture resources only match if they refer to the same image
-/// subresource *and* specify the same coded offset and extent, so those are
-/// part of the key as well.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-struct SlotKey {
-    image_view: *const nvk_image_view,
-    layer: u32,
-    coded_offset: (i32, i32),
-    coded_extent: (u32, u32),
-}
-
-/// Build the [`SlotKey`] for a Vulkan picture resource.
-fn slot_key(res: &ffi::VkVideoPictureResourceInfoKHR) -> SlotKey {
-    let image_view =
-        unsafe { ffi::nvk_image_view_from_handle(res.imageViewBinding) };
-    SlotKey {
-        image_view,
-        layer: unsafe { (*image_view).vk.base_array_layer }
-            + res.baseArrayLayer,
-        coded_offset: (res.codedOffset.x, res.codedOffset.y),
-        coded_extent: (res.codedExtent.width, res.codedExtent.height),
-    }
-}
-
-/// A GPU address in the form the engine's offset methods take: shifted right
-/// by 8, so the low 8 bits have to be zero for the address to survive the
-/// round trip.
-fn addr_hi(addr: u64) -> u32 {
-    assert!(addr & 0xff == 0, "address {addr:#x} is not 256B aligned");
-    (addr >> 8).try_into().unwrap()
-}
-
-/// Address (already shifted right by 8, as the hardware expects) of the given
-/// plane and DPB array layer of an image. For "separated" DPB the layer is 0
-/// and this is just the plane base address; for "layered" DPB the layer selects
-/// the picture within the array image.
-fn plane_layer_base(img: *mut nvk_image, plane: u8, layer: u32) -> u32 {
-    let base = unsafe { ffi::nvk_image_base_address(img, plane) };
-    let array_stride =
-        unsafe { (*img).planes[plane as usize].nil.array_stride_B };
-    addr_hi(base + u64::from(layer) * array_stride)
 }
 
 /// Session data stored in opaque `nvk_video_session::rust` pointer.
