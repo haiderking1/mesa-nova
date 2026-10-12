@@ -1577,6 +1577,9 @@ struct zink_screen {
    } driver_workarounds;
 
    VkImageUsageFlags video_output_usage;
+   /* Whether the driver applies the film grain of AV1 frames, once queried. */
+   bool video_av1_film_grain_queried;
+   bool video_av1_film_grain;
    struct zink_video_format_prop video_format_prop_dpb;
    struct zink_video_format_prop video_format_prop_output;
 };
