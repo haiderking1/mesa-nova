@@ -12,6 +12,10 @@ use crate::ILog2Ceil;
 use nil_rs_bindings::*;
 use nvidia_headers::classes::{cl9097, clc597, clcd97};
 
+/// The block height (log2 of GOBs) of the images the video engines write:
+/// they write GOB_2 blocks whatever the surface's size (see Tiling::choose()).
+pub const VIDEO_Y_LOG2: u8 = 1;
+
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum GOBType {
@@ -436,7 +440,7 @@ impl Tiling {
             // layout disagree with the surface tiling used on readback, which
             // produces garbage for H.265 (H.264 firmware happens to honor the
             // field, so it tolerated larger values). Force GOB_2 for video.
-            tiling.y_log2 = 1;
+            tiling.y_log2 = VIDEO_Y_LOG2;
         }
 
         if max_tile_size_B > 0 {
