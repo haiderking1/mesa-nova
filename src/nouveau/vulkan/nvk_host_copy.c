@@ -11,6 +11,8 @@
 
 #include "vk_format.h"
 
+#include "util/streaming-load-memcpy.h"
+
 static struct nil_Offset4D_Pixels
 vk_to_nil_offset(const struct vk_image *image, VkOffset3D offset,
                  uint32_t base_array_layer)
@@ -290,19 +292,64 @@ nvk_copy_image_to_memory(struct nvk_image *src,
       struct nil_Extent4D_Bytes copy_extent_B = extent_B;
       copy_extent_B.array_len = 1;
 
+      /* Memory outside of GART is mapped write-combined, which the CPU reads
+       * uncached, a load at a time: detiling straight from it reads
+       * megabytes a second. The block rows the copy reads are streamed into
+       * cached memory first, and detiled from there. Their layout is the
+       * same from a block row on, whatever the rows before it.
+       */
+      const struct nil_tiling *tiling = &src_level->tiling;
+      const bool bounce = !(src_plane->host_mem->mem->flags & NVKMD_MEM_GART) &&
+                          tiling->z_log2 == 0 && level_extent_B.depth == 1;
+      const uint32_t block_h = nil_gob_type_height(tiling->gob_type) << tiling->y_log2;
+      const uint32_t rows_start = offset_B.y / block_h * block_h;
+      const uint32_t rows_end = align(offset_B.y + extent_B.height, block_h);
+      const size_t bounce_B = (size_t)(rows_end - rows_start) *
+                              src_level->row_stride_B;
+      void *bounce_ptr = NULL;
+      if (bounce) {
+         bounce_ptr = malloc(bounce_B);
+         if (bounce_ptr == NULL) {
+            nvk_image_plane_unmap(src_plane);
+            return vk_error(src, VK_ERROR_OUT_OF_HOST_MEMORY);
+         }
+      }
+
       for (unsigned a = 0; a < layer_count; a++) {
-         nil_copy_tiled_to_linear(dst_ptr,
-                                  buffer_layout.row_stride_B,
-                                  buffer_layout.image_stride_B,
-                                  src_ptr,
-                                  level_extent_B,
-                                  offset_B,
-                                  copy_extent_B,
-                                  &src_level->tiling);
+         if (bounce) {
+            util_streaming_load_memcpy(bounce_ptr,
+                                       (void *)(src_ptr + (size_t)rows_start *
+                                                          src_level->row_stride_B),
+                                       bounce_B);
+
+            struct nil_Extent4D_Bytes rows_extent_B = level_extent_B;
+            rows_extent_B.height = rows_end - rows_start;
+            struct nil_Offset4D_Bytes rows_offset_B = offset_B;
+            rows_offset_B.y -= rows_start;
+            nil_copy_tiled_to_linear(dst_ptr,
+                                     buffer_layout.row_stride_B,
+                                     buffer_layout.image_stride_B,
+                                     bounce_ptr,
+                                     rows_extent_B,
+                                     rows_offset_B,
+                                     copy_extent_B,
+                                     tiling);
+         } else {
+            nil_copy_tiled_to_linear(dst_ptr,
+                                     buffer_layout.row_stride_B,
+                                     buffer_layout.image_stride_B,
+                                     src_ptr,
+                                     level_extent_B,
+                                     offset_B,
+                                     copy_extent_B,
+                                     tiling);
+         }
 
          src_ptr += src_plane->nil.array_stride_B;
          dst_ptr += buffer_layout.image_stride_B;
       }
+
+      free(bounce_ptr);
    }
 
    nvk_image_plane_unmap(src_plane);
