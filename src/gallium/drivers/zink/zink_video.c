@@ -789,15 +789,24 @@ zink_video_buffer_create(struct pipe_context *pctx, const struct pipe_video_buff
    struct pipe_video_buffer vidbuf = *templ;
    uint64_t *modifiers = NULL;
    int modifiers_count = 0;
-   uint64_t mod[3] = { 0 };
-   int count;
 
    vidbuf.bind |= ZINK_BIND_VIDEO;
-   pctx->screen->query_dmabuf_modifiers(pctx->screen, templ->buffer_format, 3, mod, NULL, &count);
 
+   /* All the modifiers of the format: the driver picks one the decoder can
+    * write, which may be any of them.
+    */
    if (pctx->screen->resource_create_with_modifiers) {
-      modifiers = mod;
-      modifiers_count = MIN2(count, ARRAY_SIZE(mod));
+      pctx->screen->query_dmabuf_modifiers(pctx->screen, templ->buffer_format,
+                                           0, NULL, NULL, &modifiers_count);
+      if (modifiers_count > 0) {
+         modifiers = malloc(modifiers_count * sizeof(*modifiers));
+         if (!modifiers)
+            return NULL;
+         pctx->screen->query_dmabuf_modifiers(pctx->screen,
+                                              templ->buffer_format,
+                                              modifiers_count, modifiers,
+                                              NULL, &modifiers_count);
+      }
    }
 
    struct zink_video_caps_info caps_info = { 0 };
@@ -810,7 +819,11 @@ zink_video_buffer_create(struct pipe_context *pctx, const struct pipe_video_buff
       vidbuf.flags = ZINK_RESOURCE_FLAG_VIDEO_OUTPUT;
    }
 
-   return vl_video_buffer_create_as_resource(pctx, &vidbuf, modifiers, modifiers_count);
+   struct pipe_video_buffer *buf =
+      vl_video_buffer_create_as_resource(pctx, &vidbuf, modifiers,
+                                         modifiers_count);
+   free(modifiers);
+   return buf;
 }
 
 static StdVideoH264ProfileIdc
