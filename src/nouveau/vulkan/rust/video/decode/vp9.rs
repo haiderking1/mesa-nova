@@ -415,7 +415,27 @@ impl VideoDecoder for Decoder {
         let filter_rows = sb_rows * (tile_cols - 1).max(1);
 
         let mut pic: _nvdec_vp9_pic_s = unsafe { std::mem::zeroed() };
-        pic.stream_len = frame_info.srcBufferRange.try_into().unwrap();
+        // The frame, which may start anywhere in the bitstream range, such as
+        // in a superframe. The decoder takes the bitstream's address in units
+        // of 256 bytes: it is given the bytes before the frame from there,
+        // which it skips, as it only reads the frame from its compressed
+        // header on.
+        let src_buffer =
+            unsafe { ffi::nvk_buffer_from_handle(frame_info.srcBuffer) };
+        let src = unsafe {
+            ffi::vk_buffer_address(
+                &(*src_buffer).vk,
+                frame_info.srcBufferOffset
+                    + u64::from(vp9.uncompressedHeaderOffset),
+            )
+        };
+        let src_base = src & !0xff;
+        let lead: u32 = (src - src_base).try_into().unwrap();
+        let frame_len: u32 = (frame_info.srcBufferRange
+            - u64::from(vp9.uncompressedHeaderOffset))
+        .try_into()
+        .unwrap();
+        pic.stream_len = lead + frame_len;
         pic.gptimer_timeout_value = timeout(width, height);
         pic.set_tileformat(1);
         let y_log2 =
@@ -502,7 +522,7 @@ impl VideoDecoder for Decoder {
         let mut parser = ParserSetup {
             compressed_header_size: vp9.tilesOffset
                 - vp9.compressedHeaderOffset,
-            compressed_header_offset: (vp9.compressedHeaderOffset
+            compressed_header_offset: (lead + vp9.compressedHeaderOffset
                 - vp9.uncompressedHeaderOffset)
                 .try_into()
                 .unwrap(),
@@ -610,16 +630,6 @@ impl VideoDecoder for Decoder {
         let counters = probs + u64::from(ffi::NVK_VP9_COUNTERS_OFFSET_B);
         let prev_pic = probs + u64::from(ffi::NVK_VP9_PREV_PIC_OFFSET_B);
 
-        let src_buffer =
-            unsafe { ffi::nvk_buffer_from_handle(frame_info.srcBuffer) };
-        let src = unsafe {
-            ffi::vk_buffer_address(
-                &(*src_buffer).vk,
-                frame_info.srcBufferOffset
-                    + u64::from(vp9.uncompressedHeaderOffset),
-            )
-        };
-
         let pic_addr = upload(cmd, &pic)?;
         let parser_addr = upload(cmd, &parser)?;
         let tiles_addr = unsafe {
@@ -662,7 +672,7 @@ impl VideoDecoder for Decoder {
                 offset: addr_hi(pic_addr),
             });
             push.push_mthd(clc7b0::SetInBufBaseOffset {
-                offset: addr_hi(src),
+                offset: addr_hi(src_base),
             });
             // Frames without references, key frames, are given the frame itself.
             for (i, r) in refs.iter().enumerate() {
