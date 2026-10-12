@@ -150,6 +150,41 @@ fn plane_layer_base(img: *mut nvk_image, plane: u8, layer: u32) -> u32 {
     addr_hi(base + u64::from(layer) * array_stride)
 }
 
+/// A picture the decoder reads or writes.
+pub(super) struct Picture {
+    pub(super) img: *mut nvk_image,
+    pub(super) layer: u32,
+    pub(super) width: u32,
+    pub(super) height: u32,
+}
+
+impl Picture {
+    pub(super) fn new(res: &ffi::VkVideoPictureResourceInfoKHR) -> Self {
+        let key = slot_key(res);
+        Picture {
+            img: unsafe { (*key.image_view).vk.image as *mut nvk_image },
+            layer: key.layer,
+            width: res.codedExtent.width,
+            height: res.codedExtent.height,
+        }
+    }
+
+    /// The row pitch of `plane` in bytes.
+    pub(super) fn stride(&self, plane: usize) -> u16 {
+        let pitch =
+            unsafe { (*self.img).planes[plane].nil.levels[0].row_stride_B };
+        pitch.try_into().unwrap()
+    }
+
+    pub(super) fn luma(&self) -> u32 {
+        plane_layer_base(self.img, 0, self.layer)
+    }
+
+    pub(super) fn chroma(&self) -> u32 {
+        plane_layer_base(self.img, 1, self.layer)
+    }
+}
+
 struct SessionData {
     decoder: Box<dyn VideoDecoder>,
 }
