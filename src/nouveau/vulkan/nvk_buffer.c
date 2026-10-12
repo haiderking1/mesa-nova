@@ -37,6 +37,13 @@ nvk_get_buffer_alignment(const struct nvk_physical_device *pdev,
    if (usage_flags & VK_BUFFER_USAGE_2_PREPROCESS_BUFFER_BIT_EXT)
       alignment = MAX2(alignment, NVK_DGC_ALIGN);
 
+   /* The video decoder takes the bitstream's address in units of 256 bytes,
+    * so the bitstream buffer's start has to be 256B aligned, as its offsets
+    * are (minBitstreamBufferOffsetAlignment).
+    */
+   if (usage_flags & VK_BUFFER_USAGE_2_VIDEO_DECODE_SRC_BIT_KHR)
+      alignment = MAX2(alignment, 256);
+
    if (create_flags & (VK_BUFFER_CREATE_SPARSE_BINDING_BIT |
                        NVK_BUFFER_CREATE_CAPTURE_REPLAY_BITS))
       alignment = MAX2(alignment, pdev->nvkmd->bind_align_B);
