@@ -64,9 +64,16 @@ struct zink_video_codec {
     * created at its address.
     */
    uint64_t dpb_pics[17];
-   /* for separate dpb/dst storage */
+   /* for separate dpb/dst storage: the codedExtent of dpb_resources is the
+    * size of the image, which grows with the frames for VP9
+    */
+   enum pipe_format dpb_format;
    struct pipe_resource *dpb_res[17];
    VkVideoPictureResourceInfoKHR dpb_resources[17];
+   /* The views of DPB images replaced by larger ones, which the decodes
+    * submitted before may still use: destroyed with the codec
+    */
+   struct util_dynarray retired_views;
 };
 
 struct zink_video_surf_data {
