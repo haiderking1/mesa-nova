@@ -57,6 +57,23 @@ nvk_CreateVideoSessionKHR(VkDevice _device,
       break;
    }
 
+   case VK_VIDEO_CODEC_OPERATION_DECODE_H265_BIT_KHR: {
+      const struct nvk_video_h265_mem_layout layout =
+         nvk_video_h265_mem_layout(vid->vk.max_coded.width,
+                                   vid->vk.max_coded.height,
+                                   vid->vk.luma_bit_depth ==
+                                   VK_VIDEO_COMPONENT_BIT_DEPTH_10_BIT_KHR ? 10 : 8);
+      vid->mems[NVK_H265_MEM_COLOC] = (struct nvk_vid_mem) {
+         .size_B = layout.coloc_mem_B,
+         .align_B = 4096,
+      };
+      vid->mems[NVK_H265_MEM_FILTER] = (struct nvk_vid_mem) {
+         .size_B = layout.filter_mem_B,
+         .align_B = 4096,
+      };
+      break;
+   }
+
    case VK_VIDEO_CODEC_OPERATION_DECODE_VP9_BIT_KHR: {
       /* Sizes in 64x64 superblocks, as the decoder needs for the largest
        * picture, matching what NVIDIA's driver asks for.
@@ -333,6 +350,57 @@ nvk_GetPhysicalDeviceVideoCapabilitiesKHR(VkPhysicalDevice physicalDevice,
              VK_STD_VULKAN_VIDEO_CODEC_H264_DECODE_EXTENSION_NAME);
       pCapabilities->stdHeaderVersion.specVersion =
          VK_STD_VULKAN_VIDEO_CODEC_H264_DECODE_SPEC_VERSION;
+      break;
+   }
+
+   case VK_VIDEO_CODEC_OPERATION_DECODE_H265_BIT_KHR: {
+      VK_FROM_HANDLE(nvk_physical_device, pdev, physicalDevice);
+      const struct VkVideoDecodeH265ProfileInfoKHR *h265_profile =
+         vk_find_struct_const(pVideoProfile->pNext,
+                              VIDEO_DECODE_H265_PROFILE_INFO_KHR);
+      struct VkVideoDecodeH265CapabilitiesKHR *ext =
+         vk_find_struct(pCapabilities->pNext,
+                        VIDEO_DECODE_H265_CAPABILITIES_KHR);
+
+      if (!pdev->vk.supported_extensions.KHR_video_decode_h265)
+         return VK_ERROR_VIDEO_PROFILE_CODEC_NOT_SUPPORTED_KHR;
+
+      /* Main and Main Still Picture: 8-bit 4:2:0, and Main 10: 8-bit and
+       * 10-bit 4:2:0.
+       */
+      switch (h265_profile->stdProfileIdc) {
+      case STD_VIDEO_H265_PROFILE_IDC_MAIN:
+      case STD_VIDEO_H265_PROFILE_IDC_MAIN_STILL_PICTURE:
+         if (pVideoProfile->lumaBitDepth != VK_VIDEO_COMPONENT_BIT_DEPTH_8_BIT_KHR)
+            return VK_ERROR_VIDEO_PROFILE_FORMAT_NOT_SUPPORTED_KHR;
+         break;
+      case STD_VIDEO_H265_PROFILE_IDC_MAIN_10:
+         if (pVideoProfile->lumaBitDepth != VK_VIDEO_COMPONENT_BIT_DEPTH_8_BIT_KHR &&
+             pVideoProfile->lumaBitDepth != VK_VIDEO_COMPONENT_BIT_DEPTH_10_BIT_KHR)
+            return VK_ERROR_VIDEO_PROFILE_FORMAT_NOT_SUPPORTED_KHR;
+         break;
+      default:
+         return VK_ERROR_VIDEO_PROFILE_OPERATION_NOT_SUPPORTED_KHR;
+      }
+
+      /* The limits NVIDIA's driver reports for NVDEC on Ampere. */
+      pCapabilities->pictureAccessGranularity.width = 16;
+      pCapabilities->pictureAccessGranularity.height = 16;
+      pCapabilities->minCodedExtent.width = 144;
+      pCapabilities->minCodedExtent.height = 144;
+      pCapabilities->maxCodedExtent.width = 8192;
+      pCapabilities->maxCodedExtent.height = 8192;
+      pCapabilities->flags = VK_VIDEO_CAPABILITY_SEPARATE_REFERENCE_IMAGES_BIT_KHR;
+      /* The pictures of the DPB, the picture decoded included: the decoder
+       * takes up to 16 pictures, and one more decoded to no DPB slot.
+       */
+      pCapabilities->maxDpbSlots = STD_VIDEO_H265_MAX_DPB_SIZE;
+      pCapabilities->maxActiveReferencePictures = STD_VIDEO_H265_MAX_DPB_SIZE;
+      ext->maxLevelIdc = STD_VIDEO_H265_LEVEL_IDC_6_2;
+      strcpy(pCapabilities->stdHeaderVersion.extensionName,
+             VK_STD_VULKAN_VIDEO_CODEC_H265_DECODE_EXTENSION_NAME);
+      pCapabilities->stdHeaderVersion.specVersion =
+         VK_STD_VULKAN_VIDEO_CODEC_H265_DECODE_SPEC_VERSION;
       break;
    }
 

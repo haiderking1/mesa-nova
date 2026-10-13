@@ -13,6 +13,8 @@ mod av1_film_grain;
 mod av1_gaussian;
 mod av1_probs;
 mod h264;
+mod h265;
+mod h265_slice;
 mod vp9;
 mod vp9_default_probs;
 
@@ -218,6 +220,9 @@ pub extern "C" fn nvk_video_create_video_session(
     vid: &mut ffi::nvk_video_session,
 ) {
     let decoder: Box<dyn VideoDecoder> = match vid.vk.op {
+        ffi::VK_VIDEO_CODEC_OPERATION_DECODE_H265_BIT_KHR => {
+            Box::new(h265::Decoder::default())
+        }
         ffi::VK_VIDEO_CODEC_OPERATION_DECODE_VP9_BIT_KHR => {
             Box::new(vp9::Decoder::default())
         }

@@ -10,6 +10,22 @@
 
 #include "vulkan/runtime/vk_video.h"
 
+/* The memory of H.265 sessions, by binding.
+ *
+ * NVK_H265_MEM_COLOC: the co-located motion vectors of the picture of each
+ * DPB slot, and of the picture decoded without one, which temporal motion
+ * vector prediction reads.
+ *
+ * NVK_H265_MEM_FILTER: the deblocking, SAO and parser buffers of the tile
+ * column and slice boundaries, then the intra prediction top line.
+ *
+ * The sizes depend on the largest picture, see nvk_video_h265_mem_layout().
+ */
+enum nvk_h265_mem {
+   NVK_H265_MEM_COLOC,
+   NVK_H265_MEM_FILTER,
+};
+
 /* The memory of VP9 sessions, by binding.
  *
  * NVK_VP9_MEM_SEG_MV: the segmentation maps and the co-located motion
