@@ -59,6 +59,9 @@ zink_destroy_video_codec(struct pipe_video_codec *codec) {
    simple_mtx_lock(screen->queue_lock);
    VKSCR(QueueWaitIdle)(screen->queue_video_decode);
    simple_mtx_unlock(screen->queue_lock);
+   util_dynarray_foreach(&zvc->retired_views, VkImageView, view)
+      VKSCR(DestroyImageView)(screen->dev, *view, NULL);
+   util_dynarray_fini(&zvc->retired_views);
    if (!zvc->coincide_dpb) {
       for (unsigned i = 0; i < zvc->max_dpb_slots; i++)
          VKSCR(DestroyImageView)(screen->dev, zvc->dpb_resources[i].imageViewBinding, NULL);
@@ -102,6 +105,75 @@ zink_destroy_associated_data(void *data)
    free(surf);
 }
 
+/* With separate DPB and output pictures, creates the DPB image of the slot,
+ * or the array of all the slots' images (slot 0), of the given size, and the
+ * views of the slots' pictures in it.
+ */
+static void
+create_dpb_image(struct zink_video_codec *zvc, unsigned slot,
+                 uint32_t width, uint32_t height)
+{
+   struct zink_screen *screen = zink_screen(zvc->screen);
+   const unsigned first = zvc->dpb_array ? 0 : slot;
+   const unsigned count = zvc->dpb_array ? zvc->max_dpb_slots : 1;
+   struct pipe_resource dpb_templ = {};
+   struct pipe_surface psurf = {};
+
+   dpb_templ.width0 = width;
+   dpb_templ.height0 = height * 2;
+   dpb_templ.depth0 = 1;
+   dpb_templ.format = zvc->dpb_format;
+   dpb_templ.target = zvc->dpb_array ? PIPE_TEXTURE_2D_ARRAY : PIPE_TEXTURE_2D;
+   dpb_templ.usage = PIPE_USAGE_DEFAULT;
+   dpb_templ.flags = ZINK_RESOURCE_FLAG_VIDEO_DPB | PIPE_RESOURCE_FLAG_DONT_MAP_DIRECTLY | ZINK_RESOURCE_FLAG_INTERNAL_ONLY;
+   dpb_templ.bind = ZINK_BIND_VIDEO;
+   dpb_templ.array_size = count;
+
+   psurf.format = zvc->dpb_format;
+
+   zvc->dpb_res[slot] = screen->base.resource_create(&screen->base, &dpb_templ);
+   for (unsigned i = first; i < first + count; i++) {
+      psurf.first_layer = psurf.last_layer = i - first;
+      VkImageViewCreateInfo ivci = create_ivci(screen, zink_resource(zvc->dpb_res[slot]),
+                                               &psurf, PIPE_TEXTURE_2D);
+      ivci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+      zvc->dpb_resources[i].sType = VK_STRUCTURE_TYPE_VIDEO_PICTURE_RESOURCE_INFO_KHR;
+      zvc->dpb_resources[i].pNext = NULL;
+      zvc->dpb_resources[i].codedExtent.width = width;
+      zvc->dpb_resources[i].codedExtent.height = height;
+      VKSCR(CreateImageView)(screen->dev, &ivci, NULL, &zvc->dpb_resources[i].imageViewBinding);
+   }
+}
+
+/* With separate DPB and output pictures, makes the DPB image of the slot of
+ * the picture surf at least the size of the frame decoded to it, as a VP9
+ * frame may be larger than the frames before it. The slot is the one set up
+ * for the frame, which holds no reference. A DPB array holds all the slots'
+ * pictures, which are lost with it: without separate reference images,
+ * Vulkan wants all the references in one image.
+ */
+static void
+fit_dpb_image(struct zink_video_codec *zvc,
+              const struct zink_video_surf_data *surf)
+{
+   const unsigned slot = zvc->dpb_array ? 0 : surf->dpb_index;
+   const VkExtent2D have = zvc->dpb_resources[surf->dpb_index].codedExtent;
+   const VkExtent2D need = surf->resource.codedExtent;
+
+   if (zvc->coincide_dpb ||
+       (need.width <= have.width && need.height <= have.height))
+      return;
+
+   for (unsigned i = 0; i < zvc->max_dpb_slots; i++) {
+      if (i == surf->dpb_index || zvc->dpb_array)
+         util_dynarray_append(&zvc->retired_views, zvc->dpb_resources[i].imageViewBinding);
+   }
+   /* The batches using the image keep it until they are done */
+   pipe_resource_reference(&zvc->dpb_res[slot], NULL);
+   create_dpb_image(zvc, slot, MAX2(need.width, have.width),
+                    MAX2(need.height, have.height));
+}
+
 static void
 zink_video_create_session(struct zink_video_codec *zvc,
                           uint32_t width, uint32_t height,
@@ -128,50 +200,13 @@ zink_video_create_session(struct zink_video_codec *zvc,
    zvc->max_dpb_slots = caps_info.caps.maxDpbSlots;
    zvc->coincide_dpb = caps_info.dec_caps.flags & VK_VIDEO_DECODE_CAPABILITY_DPB_AND_OUTPUT_COINCIDE_BIT_KHR;
    zvc->dpb_array = !(caps_info.caps.flags & VK_VIDEO_CAPABILITY_SEPARATE_REFERENCE_IMAGES_BIT_KHR);
+   zvc->dpb_format = format;
    if (!zvc->coincide_dpb) {
-      struct pipe_resource dpb_templ = {};
-      struct pipe_surface psurf = {};
-      dpb_templ.width0 = width;
-      dpb_templ.height0 = height * 2;
-      dpb_templ.depth0 = 1;
-      dpb_templ.format = format,
-      dpb_templ.target = PIPE_TEXTURE_2D;
-      dpb_templ.usage = PIPE_USAGE_DEFAULT;
-      dpb_templ.flags = ZINK_RESOURCE_FLAG_VIDEO_DPB | PIPE_RESOURCE_FLAG_DONT_MAP_DIRECTLY | ZINK_RESOURCE_FLAG_INTERNAL_ONLY;
-      dpb_templ.bind = ZINK_BIND_VIDEO;
-      dpb_templ.array_size = 1;
-
-      psurf.format = format;
-
       if (zvc->dpb_array) {
-         dpb_templ.array_size = zvc->max_dpb_slots;
-         dpb_templ.target = PIPE_TEXTURE_2D_ARRAY;
-         zvc->dpb_res[0] = screen->base.resource_create(&screen->base,
-                                                        &dpb_templ);
-         for (unsigned i = 0; i < zvc->max_dpb_slots; i++) {
-            psurf.first_layer = psurf.last_layer = i;
-            VkImageViewCreateInfo ivci = create_ivci(screen, zink_resource(zvc->dpb_res[0]),
-                                                     &psurf, PIPE_TEXTURE_2D);
-            ivci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            zvc->dpb_resources[i].sType = VK_STRUCTURE_TYPE_VIDEO_PICTURE_RESOURCE_INFO_KHR;
-            zvc->dpb_resources[i].pNext = NULL;
-            zvc->dpb_resources[i].codedExtent.width = width;
-            zvc->dpb_resources[i].codedExtent.height = height;
-            VKSCR(CreateImageView)(screen->dev, &ivci, NULL, &zvc->dpb_resources[i].imageViewBinding);
-         }
+         create_dpb_image(zvc, 0, width, height);
       } else {
-         for (unsigned i = 0; i < zvc->max_dpb_slots; i++) {
-            zvc->dpb_res[i] = screen->base.resource_create(&screen->base,
-                                                           &dpb_templ);
-            zvc->dpb_resources[i].sType = VK_STRUCTURE_TYPE_VIDEO_PICTURE_RESOURCE_INFO_KHR;
-            zvc->dpb_resources[i].pNext = NULL;
-            zvc->dpb_resources[i].codedExtent.width = width;
-            zvc->dpb_resources[i].codedExtent.height = height;
-            VkImageViewCreateInfo ivci = create_ivci(screen, zink_resource(zvc->dpb_res[i]),
-                                                     &psurf, PIPE_TEXTURE_2D);
-            ivci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            VKSCR(CreateImageView)(screen->dev, &ivci, NULL, &zvc->dpb_resources[i].imageViewBinding);
-         }
+         for (unsigned i = 0; i < zvc->max_dpb_slots; i++)
+            create_dpb_image(zvc, i, width, height);
       }
    }
 
@@ -192,8 +227,17 @@ zink_video_create_session(struct zink_video_codec *zvc,
    sci.sType = VK_STRUCTURE_TYPE_VIDEO_SESSION_CREATE_INFO_KHR;
    sci.queueFamilyIndex = screen->video_decode_queue;
    sci.pVideoProfile = &vk_profile.profile;
-   sci.maxCodedExtent.width = width;
-   sci.maxCodedExtent.height = height;
+   /* A VP9 frame may be of any size, and use the frames before it as
+    * references, and the frame contexts they saved, which are the session's,
+    * whatever their size: the session is for the largest frames of the
+    * profile, not only for the size of the first frames.
+    */
+   if (vid_format == PIPE_VIDEO_FORMAT_VP9) {
+      sci.maxCodedExtent = caps_info.caps.maxCodedExtent;
+   } else {
+      sci.maxCodedExtent.width = width;
+      sci.maxCodedExtent.height = height;
+   }
    sci.pictureFormat = zink_get_format(screen, format);
    sci.referencePictureFormat = zink_get_format(screen, format);
    sci.maxActiveReferencePictures = caps_info.caps.maxActiveReferencePictures;
@@ -874,6 +918,7 @@ zink_end_frame_vp9(struct pipe_video_codec *codec,
       assign_dpb_slots(zvc, target, vp9->ref, STD_VIDEO_VP9_NUM_REF_FRAMES);
    surf->resource.codedExtent.width = vp9->picture_parameter.frame_width;
    surf->resource.codedExtent.height = vp9->picture_parameter.frame_height;
+   fit_dpb_image(zvc, surf);
 
    /* The references of the frame, LAST, GOLDEN and ALTREF, which may be the
     * same picture, and the setup slot for the frame.
@@ -1696,6 +1741,7 @@ zink_create_video_codec(struct pipe_context *pctx, const struct pipe_video_codec
    }
 
    zvc->screen = pctx->screen;
+   util_dynarray_init(&zvc->retired_views, NULL);
    zvc->bitstream_mgr = u_upload_create(pctx, BITSTREAM_UPLOAD_SIZE, ZINK_BIND_VIDEO, PIPE_USAGE_STAGING, 0);
 
    return &zvc->base;
