@@ -872,9 +872,11 @@ submit_queue(void *data, void *gdata, int thread_index)
        * wait on.
        */
       if (res->obj->exportable_dmabuf && !bs->is_device_lost) {
-         for (; res; res = zink_resource(res->base.b.next)) {
-            bool write = zink_batch_usage_matches(res->obj->bo->writes.u, bs);
-            zink_screen_import_dmabuf_semaphore(screen, res, sem[i++], write);
+         for (struct zink_resource *r = res; r; r = zink_resource(r->base.b.next)) {
+            if (!zink_resource_plane_owns_dmabuf(res, r))
+               continue;
+            bool write = zink_batch_usage_matches(r->obj->bo->writes.u, bs);
+            zink_screen_import_dmabuf_semaphore(screen, r, sem[i++], write);
          }
       }
 
@@ -980,6 +982,8 @@ zink_end_batch(struct zink_context *ctx)
          continue;
       bool write = zink_batch_usage_matches(res->obj->bo->writes.u, bs);
       for (struct zink_resource *r = res; r; r = zink_resource(r->base.b.next)) {
+         if (!zink_resource_plane_owns_dmabuf(res, r))
+            continue;
          VkSemaphore sem = zink_screen_export_dmabuf_semaphore(screen, r, write);
          if (sem)
             util_dynarray_append(&bs->fd_wait_semaphores, sem);
@@ -1036,7 +1040,9 @@ zink_end_batch(struct zink_context *ctx)
       }
 
       if (res->obj->exportable_dmabuf) {
-         for (; res; res = zink_resource(res->base.b.next)) {
+         for (struct zink_resource *r = res; r; r = zink_resource(r->base.b.next)) {
+            if (!zink_resource_plane_owns_dmabuf(res, r))
+               continue;
             VkSemaphore sem = zink_create_exportable_semaphore(screen);
             if (sem) {
                util_dynarray_append(&ctx->bs->signal_semaphores, sem);
