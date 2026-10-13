@@ -491,10 +491,15 @@ upload_bitstream(struct zink_context *ctx, struct zink_video_codec *zvc)
    zink_batch_reference_resource_rw(ctx, zvc->bitstream_res, true);
 }
 
+/* Ends the coding commands and submits them, giving *fence, if fence isn't
+ * NULL, a fence signaled when they are done.
+ */
 static void
 end_coding(struct zink_context *ctx,
            struct zink_video_codec *zvc,
-           VkCommandBuffer cmdbuf)
+           VkCommandBuffer cmdbuf,
+           struct pipe_fence_handle **fence,
+           unsigned flush_flags)
 {
    VkVideoEndCodingInfoKHR eci = { 0 };
    eci.sType = VK_STRUCTURE_TYPE_VIDEO_END_CODING_INFO_KHR;
@@ -524,7 +529,7 @@ end_coding(struct zink_context *ctx,
 
    ctx->bs->video_params = zvc->params;
    ctx->bs->has_work = true;
-   ctx->base.flush(&ctx->base, NULL, 0);
+   ctx->base.flush(&ctx->base, fence, fence ? flush_flags : 0);
    zink_resource_reference(&zvc->bitstream_res, NULL);
 }
 
@@ -788,7 +793,7 @@ zink_end_frame_h264(struct pipe_video_codec *codec,
    vdi.srcBufferRange = zvc->bs_range;
    VKSCR(CmdDecodeVideoKHR)(cmdbuf, &vdi);
 
-   end_coding(ctx, zvc, cmdbuf);
+   end_coding(ctx, zvc, cmdbuf, picture->out_fence, picture->flush_flags);
 
    return 0;
 }
@@ -1114,7 +1119,7 @@ zink_end_frame_vp9(struct pipe_video_codec *codec,
    vdi.srcBufferRange = zvc->bs_range;
    VKSCR(CmdDecodeVideoKHR)(cmdbuf, &vdi);
 
-   end_coding(ctx, zvc, cmdbuf);
+   end_coding(ctx, zvc, cmdbuf, picture->out_fence, picture->flush_flags);
 
    return 0;
 }
@@ -1227,7 +1232,8 @@ av1_skip_mode_frames(const struct pipe_av1_picture_desc *av1,
 }
 
 /* Copies the picture src to dst, plane by plane, after the work of the video
- * context ctx so far.
+ * context ctx so far, giving *fence, if fence isn't NULL, a fence signaled
+ * when the copy is done.
  *
  * The video queue runs no transfers, so the copy context copies: its
  * submission waits for the video queue's last one, as submissions to another
@@ -1235,7 +1241,8 @@ av1_skip_mode_frames(const struct pipe_av1_picture_desc *av1,
  */
 static void
 copy_video_buffer(struct zink_context *ctx, struct pipe_video_buffer *dst,
-                  struct pipe_video_buffer *src)
+                  struct pipe_video_buffer *src,
+                  struct pipe_fence_handle **fence, unsigned flush_flags)
 {
    struct zink_screen *screen = zink_screen(ctx->base.screen);
    struct pipe_resource *src_planes[VL_NUM_COMPONENTS] = { 0 };
@@ -1263,7 +1270,7 @@ copy_video_buffer(struct zink_context *ctx, struct pipe_video_buffer *dst,
       pctx->resource_copy_region(pctx, dst_planes[i], 0, 0, 0, 0,
                                  src_planes[i], 0, &box);
    }
-   pctx->flush(pctx, NULL, 0);
+   pctx->flush(pctx, fence, fence ? flush_flags : 0);
    zink_screen_unlock_context(screen);
 }
 
@@ -1691,19 +1698,43 @@ zink_end_frame_av1(struct pipe_video_codec *codec,
    vdi.srcBufferRange = zvc->bs_range;
    VKSCR(CmdDecodeVideoKHR)(cmdbuf, &vdi);
 
-   end_coding(ctx, zvc, cmdbuf);
-
    /* The picture shown gets the reconstructed one when the decoder doesn't
-    * apply the film grain.
+    * apply the film grain: the copy, which waits for the decode, is the work
+    * the picture's fence waits for then.
     */
-   if (apply_grain && !decoder_grain)
-      copy_video_buffer(ctx, av1->film_grain_target, target);
+   const bool copy = apply_grain && !decoder_grain;
+   end_coding(ctx, zvc, cmdbuf, copy ? NULL : picture->out_fence,
+              picture->flush_flags);
+   if (copy)
+      copy_video_buffer(ctx, av1->film_grain_target, target,
+                        picture->out_fence, picture->flush_flags);
 
    return 0;
 }
 
 static void
 zink_video_flush(struct pipe_video_codec *codec) {
+}
+
+/* Waits for the fence end_frame gave a picture, without the codec's
+ * contexts: frontends wait without the lock they use the codec under.
+ */
+static int
+zink_video_fence_wait(struct pipe_video_codec *codec,
+                      struct pipe_fence_handle *fence, uint64_t timeout)
+{
+   struct pipe_screen *pscreen = codec->context->screen;
+
+   return pscreen->fence_finish(pscreen, NULL, fence, timeout);
+}
+
+static void
+zink_video_destroy_fence(struct pipe_video_codec *codec,
+                         struct pipe_fence_handle *fence)
+{
+   struct pipe_screen *pscreen = codec->context->screen;
+
+   pscreen->fence_reference(pscreen, &fence, NULL);
 }
 
 static struct pipe_video_codec *
@@ -1731,6 +1762,8 @@ zink_create_video_codec(struct pipe_context *pctx, const struct pipe_video_codec
       break;
    }
    zvc->base.flush = zink_video_flush;
+   zvc->base.fence_wait = zink_video_fence_wait;
+   zvc->base.destroy_fence = zink_video_destroy_fence;
    zvc->base.context = pctx;
 
    zvc->decode_ctx = pctx->screen->context_create(pctx->screen, NULL,
