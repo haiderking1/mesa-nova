@@ -478,14 +478,20 @@ zink_resource_image_barrier(struct zink_context *ctx, struct zink_resource *res,
          cdt->swapchain->images[res->obj->dt_idx].layout = res->layout;
       }
    }
-   if (res->obj->exportable_dmabuf && queue_import) {
+   /* Back from another queue, the dma-buf's writers are waited for, and its
+    * readers too for a write; a write after a read in the same batch waits
+    * for the readers then.
+    */
+   bool wait_readers = is_write && res->obj->dmabuf_read_wait == ctx->bs;
+   if (res->obj->exportable_dmabuf && (queue_import || wait_readers)) {
       simple_mtx_lock(&ctx->bs->exportable_lock);
       for (struct zink_resource *r = res; r; r = zink_resource(r->base.b.next)) {
-         VkSemaphore sem = zink_screen_export_dmabuf_semaphore(zink_screen(ctx->base.screen), r);
+         VkSemaphore sem = zink_screen_export_dmabuf_semaphore(zink_screen(ctx->base.screen), r, is_write);
          if (sem)
             util_dynarray_append(&ctx->bs->fd_wait_semaphores, sem);
       }
       simple_mtx_unlock(&ctx->bs->exportable_lock);
+      res->obj->dmabuf_read_wait = is_write ? NULL : ctx->bs;
    }
 }
 

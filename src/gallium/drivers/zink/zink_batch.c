@@ -865,9 +865,14 @@ submit_queue(void *data, void *gdata, int thread_index)
       /* The semaphores of a failed submission have no signal operation
        * pending, which exporting them as sync files would wait for forever.
        */
+      /* As a writer's if the batch wrote the resource, as a reader's
+       * otherwise: those of a reader only make writers wait for it.
+       */
       if (res->obj->exportable_dmabuf && !bs->is_device_lost) {
-         for (; res; res = zink_resource(res->base.b.next))
-            zink_screen_import_dmabuf_semaphore(screen, res, sem[i++]);
+         for (; res; res = zink_resource(res->base.b.next)) {
+            bool write = zink_batch_usage_matches(res->obj->bo->writes.u, bs);
+            zink_screen_import_dmabuf_semaphore(screen, res, sem[i++], write);
+         }
       }
 
       struct pipe_resource *pres = (void*)entry->key;
