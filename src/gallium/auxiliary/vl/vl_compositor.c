@@ -504,6 +504,10 @@ vl_compositor_cleanup(struct vl_compositor *c)
    assert(c);
 
    cleanup_buffers(c);
+   if (c->pipe_gfx_supported) {
+      c->pipe->bind_vs_state(c->pipe, NULL);
+      c->pipe->bind_fs_state(c->pipe, NULL);
+   }
    cleanup_shaders(c);
    cleanup_pipe_state(c);
 }
