@@ -1,4 +1,4 @@
-# mesa-nova, soka's Mesa fork
+# mesa-nova, haider's Mesa fork
 
 Mesa with the userspace half of my [nova](https://github.com/haiderking1/nova)
 stack: NVK (Vulkan) and Zink (OpenGL) running on nova, the Rust NVIDIA kernel
