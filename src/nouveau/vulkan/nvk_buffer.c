@@ -196,10 +196,29 @@ nvk_GetDeviceBufferMemoryRequirements(
                                pInfo->pCreateInfo->usage,
                                pInfo->pCreateInfo->flags);
 
+   uint32_t memory_types = BITFIELD_MASK(pdev->mem_type_count);
+
+   /* The bitstreams of H.265 pictures are read by the CPU too: how many bits
+    * the long-term reference picture sets of their slice segment headers
+    * take, which the decoder is told to skip them, isn't given otherwise
+    * (see LongTermBits in rust/video/decode/h265.rs). Which codec the
+    * bitstreams are of the usage doesn't say.
+    */
+   if ((vk_buffer_usage_flags(pInfo->pCreateInfo) &
+        VK_BUFFER_USAGE_2_VIDEO_DECODE_SRC_BIT_KHR) &&
+       pdev->vk.supported_extensions.KHR_video_decode_h265) {
+      memory_types = 0;
+      for (unsigned i = 0; i < pdev->mem_type_count; i++) {
+         if (pdev->mem_types[i].propertyFlags &
+             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
+            memory_types |= BITFIELD_BIT(i);
+      }
+   }
+
    pMemoryRequirements->memoryRequirements = (VkMemoryRequirements) {
       .size = align64(pInfo->pCreateInfo->size, alignment),
       .alignment = alignment,
-      .memoryTypeBits = BITFIELD_MASK(pdev->mem_type_count),
+      .memoryTypeBits = memory_types,
    };
 
    vk_foreach_struct(sType, ext, pMemoryRequirements->pNext) {

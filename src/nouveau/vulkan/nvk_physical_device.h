@@ -104,6 +104,19 @@ nvk_video_h264_enabled(const struct nvk_instance *instance,
    return nvk_video_available(instance, info) && VIDEO_CODEC_H264DEC;
 }
 
+/* Whether H.265 video decode is enabled: video is available, the codec is
+ * built in, and the decoder is of Ampere on (NVC7B0_VIDEO_DECODER), whose
+ * programming, and the session memory it needs, NVK follows: those of
+ * GA10x, as NVIDIA's driver has them.
+ */
+static inline bool
+nvk_video_h265_enabled(const struct nvk_instance *instance,
+                       const struct nv_device_info *info)
+{
+   return nvk_video_available(instance, info) && VIDEO_CODEC_H265DEC &&
+          info->cls_vdec >= NVC7B0_VIDEO_DECODER;
+}
+
 /* Whether VP9 video decode is enabled: video is available, the codec is built
  * in, and the decoder parses VP9's compressed header and adapts its
  * probabilities itself, which it does from Ampere on (the VP9_PARSER methods
@@ -135,6 +148,7 @@ nvk_video_enabled(const struct nvk_instance *instance,
                   const struct nv_device_info *info)
 {
    return nvk_video_h264_enabled(instance, info) ||
+          nvk_video_h265_enabled(instance, info) ||
           nvk_video_vp9_enabled(instance, info) ||
           nvk_video_av1_enabled(instance, info);
 }
