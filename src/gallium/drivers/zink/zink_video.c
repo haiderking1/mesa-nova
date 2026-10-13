@@ -560,6 +560,8 @@ video_image_barrier(struct zink_context *ctx, VkCommandBuffer cmdbuf, struct zin
    if (is_foreign && res->obj->exportable_dmabuf) {
       simple_mtx_lock(&ctx->bs->exportable_lock);
       for (struct zink_resource *r = res; r; r = zink_resource(r->base.b.next)) {
+         if (!zink_resource_plane_owns_dmabuf(res, r))
+            continue;
          VkSemaphore sem = zink_screen_export_dmabuf_semaphore(screen, r, write);
          if (sem)
             util_dynarray_append(&ctx->bs->fd_wait_semaphores, sem);

@@ -110,6 +110,20 @@ zink_resource_copies_reset(struct zink_resource *res);
 #include "zink_bo.h"
 #include "zink_kopper.h"
 
+/* Whether plane, one of the planes chained from res, is the first of them
+ * with its memory: planes of one image share it, and their dma-buf, whose
+ * fences are then waited for and attached once.
+ */
+static ALWAYS_INLINE bool
+zink_resource_plane_owns_dmabuf(const struct zink_resource *res, const struct zink_resource *plane)
+{
+   for (const struct zink_resource *r = res; r != plane; r = zink_resource(r->base.b.next)) {
+      if (r->obj == plane->obj)
+         return false;
+   }
+   return true;
+}
+
 static ALWAYS_INLINE bool
 zink_resource_usage_is_unflushed(const struct zink_resource *res)
 {
