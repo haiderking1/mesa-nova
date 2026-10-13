@@ -56,6 +56,11 @@ zink_destroy_video_codec(struct pipe_video_codec *codec) {
    struct zink_video_codec *zvc = (struct zink_video_codec *)codec;
    struct zink_screen *screen = (struct zink_screen *)zvc->screen;
 
+   /* The decodes still queued on the flush thread are submitted first: the
+    * session's memory, which no batch holds, is freed below.
+    */
+   if (util_queue_is_initialized(&screen->flush_queue))
+      util_queue_finish(&screen->flush_queue);
    simple_mtx_lock(screen->queue_lock);
    VKSCR(QueueWaitIdle)(screen->queue_video_decode);
    simple_mtx_unlock(screen->queue_lock);

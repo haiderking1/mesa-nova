@@ -117,8 +117,13 @@ zink_context_destroy(struct pipe_context *pctx)
    if (util_queue_is_initialized(&screen->flush_queue))
       util_queue_finish(&screen->flush_queue);
    if (ctx->bs && !screen->device_lost) {
+      /* The batches, whose resources are released below, run on the
+       * context's queue.
+       */
+      VkQueue queue = ctx->flags & ZINK_CONTEXT_VIDEO_QUEUE ?
+                      screen->queue_video_decode : screen->queue;
       simple_mtx_lock(screen->queue_lock);
-      VkResult result = VKSCR(QueueWaitIdle)(screen->queue);
+      VkResult result = VKSCR(QueueWaitIdle)(queue);
       simple_mtx_unlock(screen->queue_lock);
 
       if (result != VK_SUCCESS)
