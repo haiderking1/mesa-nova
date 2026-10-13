@@ -49,8 +49,17 @@ create_mem_or_unref_handle(struct nvkmd_nova_dev *dev,
    if (!(info->flags & DRM_NOVA_GEM_VRAM))
       va_flags |= NVKMD_VA_GART;
 
+   /* nova maps VRAM with big pages where the memory and its address are both
+    * aligned to them, and VRAM objects are: align the address of those big
+    * enough to hold one.
+    */
+   uint64_t va_align_B = align_B;
+   if ((info->flags & DRM_NOVA_GEM_VRAM) &&
+       info->size >= NVKMD_NOVA_BIG_PAGE_SIZE)
+      va_align_B = MAX2(va_align_B, NVKMD_NOVA_BIG_PAGE_SIZE);
+
    result = nvkmd_dev_alloc_va(&dev->base, log_obj, va_flags, pte_kind,
-                               info->size, align_B, 0 /* fixed_addr */,
+                               info->size, va_align_B, 0 /* fixed_addr */,
                                &mem->base.va);
    if (result != VK_SUCCESS)
       goto fail_mem;
