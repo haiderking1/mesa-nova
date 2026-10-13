@@ -46,6 +46,11 @@ VkResult nvkmd_nova_try_create_pdev(struct _drmDevice *drm_device,
 #define NVKMD_NOVA_REPLAY_HEAP_END NVKMD_NOVA_KERNEL_START
 #define NVKMD_NOVA_KERNEL_START ((uint64_t)(1ull << 39))
 
+/* The big pages nova maps VRAM with, where the memory and its address are
+ * both aligned to them.
+ */
+#define NVKMD_NOVA_BIG_PAGE_SIZE ((uint64_t)64 * 1024)
+
 struct nvkmd_nova_dev {
    struct nvkmd_dev base;
 
