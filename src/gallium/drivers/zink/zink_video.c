@@ -1742,7 +1742,16 @@ zink_create_video_codec(struct pipe_context *pctx, const struct pipe_video_codec
 
    zvc->screen = pctx->screen;
    util_dynarray_init(&zvc->retired_views, NULL);
-   zvc->bitstream_mgr = u_upload_create(pctx, BITSTREAM_UPLOAD_SIZE, ZINK_BIND_VIDEO, PIPE_USAGE_STAGING, 0);
+   /* On the decode context, which uses the buffers: buffers released while
+    * still in use are kept by the batch of the context releasing them.
+    */
+   zvc->bitstream_mgr = u_upload_create(zvc->decode_ctx, BITSTREAM_UPLOAD_SIZE,
+                                        ZINK_BIND_VIDEO, PIPE_USAGE_STAGING, 0);
+   if (!zvc->bitstream_mgr) {
+      zvc->decode_ctx->destroy(zvc->decode_ctx);
+      FREE(zvc);
+      return NULL;
+   }
 
    return &zvc->base;
 }
