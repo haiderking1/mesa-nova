@@ -124,6 +124,18 @@ zink_context_destroy(struct pipe_context *pctx)
       if (result != VK_SUCCESS)
          mesa_loge("ZINK: vkQueueWaitIdle failed (%s)", vk_Result_to_str(result));
 
+      /* The context's video batches, whose resources are released below too,
+       * run on the video queue.
+       */
+      if (screen->queue_video_decode && screen->queue_video_decode != screen->queue) {
+         simple_mtx_lock(screen->queue_lock);
+         VkResult result = VKSCR(QueueWaitIdle)(screen->queue_video_decode);
+         simple_mtx_unlock(screen->queue_lock);
+
+         if (result != VK_SUCCESS)
+            mesa_loge("ZINK: vkQueueWaitIdle failed (%s)", vk_Result_to_str(result));
+      }
+
       if (screen->queue_sparse && screen->queue_sparse != screen->queue) {
          simple_mtx_lock(screen->queue_lock);
          VkResult result = VKSCR(QueueWaitIdle)(screen->queue_sparse);
