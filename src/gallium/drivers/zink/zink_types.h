@@ -1244,10 +1244,6 @@ struct zink_resource_object {
    bool is_buffer;
    bool exportable;
    bool exportable_dmabuf;
-   /* The batch that waited only for the writers of the dma-buf, to read it:
-    * writing it in that batch too must wait for its readers.
-    */
-   struct zink_batch_state *dmabuf_read_wait;
 
    /* TODO: this should be a union */
    int handle;

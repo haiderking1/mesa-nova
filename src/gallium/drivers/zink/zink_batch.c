@@ -865,8 +865,9 @@ submit_queue(void *data, void *gdata, int thread_index)
       /* The semaphores of a failed submission have no signal operation
        * pending, which exporting them as sync files would wait for forever.
        */
-      /* As a writer's if the batch wrote the resource, as a reader's
-       * otherwise: those of a reader only make writers wait for it.
+      /* Add the batch's fence as a write fence only if the batch wrote the
+       * resource; otherwise add it as a read fence, which only later writers
+       * wait on.
        */
       if (res->obj->exportable_dmabuf && !bs->is_device_lost) {
          for (struct zink_resource *r = res; r; r = zink_resource(r->base.b.next)) {
@@ -952,6 +953,25 @@ zink_end_batch(struct zink_context *ctx)
    if (ctx->tc) {
       set_foreach(&bs->active_queries, entry)
          zink_query_sync(ctx, (void*)entry->key);
+   }
+
+   /* Wait for the implicit-sync fences of the dma-bufs this batch used. Only
+    * the write fences need to be waited on if the batch just read a buffer,
+    * but all of them if the batch wrote it. The bo's usage tells which, now
+    * that the batch is complete.
+    */
+   set_foreach(&bs->exports, entry) {
+      struct zink_resource *res = (void*)entry->key;
+      if (!res->obj->exportable_dmabuf)
+         continue;
+      bool write = zink_batch_usage_matches(res->obj->bo->writes.u, bs);
+      for (struct zink_resource *r = res; r; r = zink_resource(r->base.b.next)) {
+         if (!zink_resource_plane_owns_dmabuf(res, r))
+            continue;
+         VkSemaphore sem = zink_screen_export_dmabuf_semaphore(screen, r, write);
+         if (sem)
+            util_dynarray_append(&bs->fd_wait_semaphores, sem);
+      }
    }
 
    set_foreach(&bs->exports, entry) {

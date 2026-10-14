@@ -2541,8 +2541,8 @@ zink_resource_get_dma_buf(struct zink_screen *screen, struct zink_resource *res)
 }
 #endif
 
-/* Returns a semaphore signaled once the dma-buf of res can be accessed: once
- * its writers are done, and its readers too if the access is a write.
+/* Returns a semaphore that signals once the dma-buf can be accessed: after
+ * its write fences for a read, or after all of its fences for a write.
  */
 VkSemaphore
 zink_screen_export_dmabuf_semaphore(struct zink_screen *screen, struct zink_resource *res, bool write)
@@ -2591,9 +2591,8 @@ zink_screen_export_dmabuf_semaphore(struct zink_screen *screen, struct zink_reso
    return sem;
 }
 
-/* Adds sem to the fences of the dma-buf of res, as those of a writer if the
- * access it signals the end of wrote, and of a reader otherwise: readers only
- * wait for writers.
+/* Adds sem to the dma-buf's fences: as a write fence if the access wrote
+ * the buffer, otherwise as a read fence.
  */
 bool
 zink_screen_import_dmabuf_semaphore(struct zink_screen *screen, struct zink_resource *res, VkSemaphore sem, bool write)
@@ -2614,7 +2613,7 @@ zink_screen_import_dmabuf_semaphore(struct zink_screen *screen, struct zink_reso
    int fd = zink_resource_get_dma_buf(screen, res);
    if (fd != -1) {
       struct dma_buf_import_sync_file import = {
-         .flags = write ? DMA_BUF_SYNC_WRITE : DMA_BUF_SYNC_READ,
+         .flags = write ? DMA_BUF_SYNC_RW : DMA_BUF_SYNC_READ,
          .fd = sync_file_fd,
       };
       int ioctl_ret = drmIoctl(fd, DMA_BUF_IOCTL_IMPORT_SYNC_FILE, &import);

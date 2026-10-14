@@ -557,17 +557,7 @@ video_image_barrier(struct zink_context *ctx, VkCommandBuffer cmdbuf, struct zin
    struct zink_screen *screen = zink_screen(ctx->base.screen);
    bool is_foreign = res->queue == VK_QUEUE_FAMILY_FOREIGN_EXT;
    zink_batch_reference_resource_rw(ctx, res, write);
-   if (is_foreign && res->obj->exportable_dmabuf) {
-      simple_mtx_lock(&ctx->bs->exportable_lock);
-      for (struct zink_resource *r = res; r; r = zink_resource(r->base.b.next)) {
-         if (!zink_resource_plane_owns_dmabuf(res, r))
-            continue;
-         VkSemaphore sem = zink_screen_export_dmabuf_semaphore(screen, r, write);
-         if (sem)
-            util_dynarray_append(&ctx->bs->fd_wait_semaphores, sem);
-      }
-      simple_mtx_unlock(&ctx->bs->exportable_lock);
-   }
+   /* the dma-buf's fences are waited for when the batch ends (zink_end_batch()) */
    if (res->layout == layout && !is_foreign)
       return;
 
