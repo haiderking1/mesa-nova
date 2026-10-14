@@ -205,6 +205,8 @@ zink_batch_resource_usage_set(struct zink_batch_state *bs, struct zink_resource 
          bool found = false;
          simple_mtx_lock(&bs->exportable_lock);
          _mesa_set_search_or_add(&bs->exports, res, &found);
+         if (write)
+            _mesa_set_add(&bs->dmabuf_writes, res);
          simple_mtx_unlock(&bs->exportable_lock);
          if (!found) {
             pipe_resource_reference(&pres, &res->base.b);

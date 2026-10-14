@@ -2288,6 +2288,7 @@ add_resource_bind(struct zink_context *ctx, struct zink_resource *res, unsigned 
    if (old_obj->exportable) {
       simple_mtx_lock(&ctx->bs->exportable_lock);
       _mesa_set_remove_key(&ctx->bs->exports, &staging);
+      _mesa_set_remove_key(&ctx->bs->dmabuf_writes, &staging);
       simple_mtx_unlock(&ctx->bs->exportable_lock);
    }
    zink_resource_object_reference(screen, &old_obj, NULL);

@@ -368,6 +368,7 @@ create_batch_state(struct zink_context *ctx)
    SET_CREATE(&bs->programs);
    SET_CREATE(&bs->active_queries);
    SET_CREATE(&bs->exports);
+   SET_CREATE(&bs->dmabuf_writes);
    bs->signal_semaphores = UTIL_DYNARRAY_INIT;
    bs->user_signal_semaphores = UTIL_DYNARRAY_INIT;
    bs->user_signal_semaphore_values = UTIL_DYNARRAY_INIT;
@@ -865,15 +866,14 @@ submit_queue(void *data, void *gdata, int thread_index)
       /* The semaphores of a failed submission have no signal operation
        * pending, which exporting them as sync files would wait for forever.
        */
-      /* Add the batch's fence as a write fence only if the batch wrote the
-       * resource; otherwise add it as a read fence, which only later writers
-       * wait on.
+      /* Add the batch's fence as a write fence if the batch wrote the image,
+       * otherwise as a read fence, which only later writers wait for.
        */
       if (res->obj->exportable_dmabuf && !bs->is_device_lost) {
+         bool write = _mesa_set_search(&bs->dmabuf_writes, res) != NULL;
          for (struct zink_resource *r = res; r; r = zink_resource(r->base.b.next)) {
             if (!zink_resource_plane_owns_dmabuf(res, r))
                continue;
-            bool write = zink_batch_usage_matches(r->obj->bo->writes.u, bs);
             zink_screen_import_dmabuf_semaphore(screen, r, sem[i++], write);
          }
       }
@@ -882,6 +882,7 @@ submit_queue(void *data, void *gdata, int thread_index)
       pipe_resource_reference(&pres, NULL);
    }
    _mesa_set_clear(&bs->exports, NULL);
+   _mesa_set_clear(&bs->dmabuf_writes, NULL);
 
    if (bs->sparse_semaphore)
       (void)util_dynarray_pop(&bs->acquires, VkSemaphore);
@@ -955,16 +956,15 @@ zink_end_batch(struct zink_context *ctx)
          zink_query_sync(ctx, (void*)entry->key);
    }
 
-   /* Wait for the implicit-sync fences of the dma-bufs this batch used. Only
-    * the write fences need to be waited on if the batch just read a buffer,
-    * but all of them if the batch wrote it. The bo's usage tells which, now
-    * that the batch is complete.
+   /* Wait for the implicit-sync fences of the dma-bufs this batch used: only
+    * for the write fences if the batch just read the image, but for all of
+    * them if the batch wrote it.
     */
    set_foreach(&bs->exports, entry) {
       struct zink_resource *res = (void*)entry->key;
       if (!res->obj->exportable_dmabuf)
          continue;
-      bool write = zink_batch_usage_matches(res->obj->bo->writes.u, bs);
+      bool write = _mesa_set_search(&bs->dmabuf_writes, res) != NULL;
       for (struct zink_resource *r = res; r; r = zink_resource(r->base.b.next)) {
          if (!zink_resource_plane_owns_dmabuf(res, r))
             continue;

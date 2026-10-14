@@ -654,6 +654,8 @@ struct zink_batch_state {
 
    struct set programs;
    struct set exports;
+   /* the images of exports that this batch wrote */
+   struct set dmabuf_writes;
 
 #define BUFFER_HASHLIST_SIZE 32768
    /* buffer_indices_hashlist[hash(bo)] returns -1 if the bo
