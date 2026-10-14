@@ -315,7 +315,6 @@ zink_begin_frame(struct pipe_video_codec *codec,
 {
    struct zink_video_codec *zvc = (struct zink_video_codec *)codec;
    struct zink_context *ctx = zink_context(zvc->decode_ctx);
-   struct zink_screen *screen = zink_screen(ctx->base.screen);
    zink_resource_reference(&zvc->bitstream_res, NULL);
    zvc->bs_size = 0;
 
