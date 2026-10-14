@@ -1805,7 +1805,11 @@ setup_format_list(struct zink_screen *screen, const struct pipe_resource *templ,
    if (srgb) {
       formats[0] = zink_get_format(screen, templ->format);
       formats[1] = zink_get_format(screen, srgb);
-   } else if ((templ->bind & ZINK_BIND_VIDEO) && (templ->flags & ZINK_RESOURCE_FLAG_VIDEO_OUTPUT)) {
+   } else if (num_planes > 1 &&
+              (!(templ->bind & ZINK_BIND_VIDEO) || (templ->flags & ZINK_RESOURCE_FLAG_VIDEO_OUTPUT))) {
+      /* the views of each plane, which video processing and imported YUV
+       * images are sampled through, take the plane formats
+       */
       formats[0] = zink_get_format(screen, templ->format);
       for (unsigned i = 0; i < num_planes; i++)
          formats[i + 1] = zink_get_format(screen, util_format_get_plane_format(templ->format, i));
@@ -1977,8 +1981,13 @@ resource_object_create(struct zink_screen *screen, const struct pipe_resource *t
       .user_mem = user_mem
    };
 
-   /* figure out aux plane count */
-   if (whandle && whandle->plane >= util_format_get_num_planes(whandle->format))
+   /* figure out aux plane count: the memory planes beyond the format's, and the
+    * planes after the first of a multi-planar format imported one by one (not
+    * those imported as images of their own format)
+    */
+   if (whandle &&
+       (whandle->plane >= util_format_get_num_planes(whandle->format) ||
+        (whandle->plane > 0 && templ->format == whandle->format)))
       obj->is_aux = true;
    struct pipe_resource *pnext = templ->next;
    for (obj->plane_count = 1; pnext; obj->plane_count++, pnext = pnext->next) {
@@ -2651,6 +2660,26 @@ zink_resource_from_handle(struct pipe_screen *pscreen,
       tc_buffer_disable_cpu_storage(pres);
    res->obj->immutable_handle = true;
    res->internal_format = whandle->format;
+
+   /* The planes after the first of a multi-planar format were imported as
+    * auxiliary planes, for the image to get their layouts: make them the
+    * image's planes, as zink_resource_create() makes those of the images it
+    * creates, for views of each plane.
+    */
+   const unsigned num_planes = util_format_get_num_planes(templ2.format);
+   if (num_planes > 1 && whandle->plane == 0) {
+      struct pipe_resource *pnext = pres->next;
+      for (unsigned p = 1; p < num_planes && pnext; p++, pnext = pnext->next) {
+         struct zink_resource *plane = zink_resource(pnext);
+         if (!plane->obj->is_aux)
+            break;
+         zink_resource_object_reference(screen, &plane->obj, res->obj);
+         plane->plane = p;
+         plane->aspect = plane_aspects[p];
+         plane->base.b.format = util_format_get_plane_format(templ2.format, p);
+         plane->internal_format = plane->base.b.format;
+      }
+   }
 
 #ifdef HAVE_LIBDRM
    if (screen->ro) {
