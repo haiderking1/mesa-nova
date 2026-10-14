@@ -224,6 +224,10 @@ zink_video_create_session(struct zink_video_codec *zvc,
       VK_STD_VULKAN_VIDEO_CODEC_H264_DECODE_EXTENSION_NAME,
       VK_STD_VULKAN_VIDEO_CODEC_H264_DECODE_SPEC_VERSION
    };
+   const VkExtensionProperties h265_props = {
+      VK_STD_VULKAN_VIDEO_CODEC_H265_DECODE_EXTENSION_NAME,
+      VK_STD_VULKAN_VIDEO_CODEC_H265_DECODE_SPEC_VERSION
+   };
    const VkExtensionProperties vp9_props = {
       VK_STD_VULKAN_VIDEO_CODEC_VP9_DECODE_EXTENSION_NAME,
       VK_STD_VULKAN_VIDEO_CODEC_VP9_DECODE_SPEC_VERSION
@@ -253,6 +257,9 @@ zink_video_create_session(struct zink_video_codec *zvc,
    sci.maxActiveReferencePictures = caps_info.caps.maxActiveReferencePictures;
    sci.maxDpbSlots = caps_info.caps.maxDpbSlots;
    switch (vid_format) {
+   case PIPE_VIDEO_FORMAT_HEVC:
+      sci.pStdHeaderVersion = &h265_props;
+      break;
    case PIPE_VIDEO_FORMAT_VP9:
       sci.pStdHeaderVersion = &vp9_props;
       break;
@@ -1188,6 +1195,390 @@ zink_end_frame_vp9(struct pipe_video_codec *codec,
    return 0;
 }
 
+/* The offsets of the slice segments of the frame in its bitstream: those of
+ * the start codes of its VCL NAL units, which VA-API gives with start codes,
+ * and which no other bytes of NAL units start with.
+ */
+static unsigned
+h265_slice_segment_offsets(const struct zink_video_codec *zvc,
+                           uint32_t *offsets, unsigned max_offsets)
+{
+   const uint8_t *data = zvc->bs_data;
+   unsigned count = 0;
+
+   for (size_t i = 0; i + 3 < zvc->bs_size && count < max_offsets; i++) {
+      if (data[i] != 0 || data[i + 1] != 0 || data[i + 2] != 1)
+         continue;
+      /* nal_unit_type, after forbidden_zero_bit: the VCL ones are 0-31 */
+      if (((data[i + 3] >> 1) & 0x3f) < 32)
+         offsets[count++] = i;
+      i += 2;
+   }
+   return count;
+}
+
+static StdVideoH265ProfileIdc
+h265_profile_conv(enum pipe_video_profile profile)
+{
+   switch (profile) {
+   case PIPE_VIDEO_PROFILE_HEVC_MAIN_10:
+      return STD_VIDEO_H265_PROFILE_IDC_MAIN_10;
+   case PIPE_VIDEO_PROFILE_HEVC_MAIN_STILL:
+      return STD_VIDEO_H265_PROFILE_IDC_MAIN_STILL_PICTURE;
+   default:
+      return STD_VIDEO_H265_PROFILE_IDC_MAIN;
+   }
+}
+
+static int
+zink_end_frame_h265(struct pipe_video_codec *codec,
+                    struct pipe_video_buffer *target,
+                    struct pipe_picture_desc *picture)
+{
+   struct zink_video_codec *zvc = (struct zink_video_codec *)codec;
+   struct zink_context *ctx = zink_context(codec->context);
+   struct zink_screen *screen = (struct zink_screen *)zvc->screen;
+   struct pipe_h265_picture_desc *h265 = (struct pipe_h265_picture_desc *)picture;
+   struct pipe_h265_pps *ppps = h265->pps;
+   struct pipe_h265_sps *psps = ppps->sps;
+
+   begin_video_batch(ctx);
+   upload_bitstream(ctx, zvc);
+
+   /* The pictures of the DPB, the references of the picture and of those
+    * after it, stay in the DPB.
+    */
+   struct zink_video_surf_data *surf =
+      assign_dpb_slots(zvc, target, h265->ref, ARRAY_SIZE(h265->ref));
+   surf->resource.codedExtent.width = psps->pic_width_in_luma_samples;
+   surf->resource.codedExtent.height = psps->pic_height_in_luma_samples;
+
+   /* The references, and the setup slot for the picture. The reference
+    * picture sets name them by their index in ref[], and Vulkan by their
+    * DPB slot.
+    */
+   struct zink_video_surf_data *ref_surfs[ARRAY_SIZE(h265->ref)] = { 0 };
+   StdVideoDecodeH265ReferenceInfo ref_std[ARRAY_SIZE(h265->ref) + 1] = { 0 };
+   VkVideoDecodeH265DpbSlotInfoKHR ref_dpb[ARRAY_SIZE(h265->ref) + 1];
+   VkVideoPictureResourceInfoKHR ref_res[ARRAY_SIZE(h265->ref) + 1];
+   VkVideoReferenceSlotInfoKHR ref_info[ARRAY_SIZE(h265->ref) + 1] = { 0 };
+   unsigned num_refs = 0;
+   for (unsigned i = 0; i < ARRAY_SIZE(h265->ref); i++) {
+      if (!h265->ref[i])
+         continue;
+      struct zink_video_surf_data *rsurf = picture_data(h265->ref[i]);
+      if (!in_dpb(zvc, rsurf))
+         continue;
+
+      bool listed = false;
+      for (unsigned j = 0; j < num_refs; j++)
+         listed |= ref_info[j].slotIndex == rsurf->dpb_index;
+      ref_surfs[i] = rsurf;
+      if (listed)
+         continue;
+
+      ref_std[num_refs].flags.used_for_long_term_reference = h265->IsLongTerm[i];
+      ref_std[num_refs].PicOrderCntVal = h265->PicOrderCntVal[i];
+      ref_dpb[num_refs] = (VkVideoDecodeH265DpbSlotInfoKHR) {
+         .sType = VK_STRUCTURE_TYPE_VIDEO_DECODE_H265_DPB_SLOT_INFO_KHR,
+         .pStdReferenceInfo = &ref_std[num_refs],
+      };
+      ref_res[num_refs] = dpb_picture_resource(zvc, rsurf);
+      ref_info[num_refs].sType = VK_STRUCTURE_TYPE_VIDEO_REFERENCE_SLOT_INFO_KHR;
+      ref_info[num_refs].pNext = &ref_dpb[num_refs];
+      ref_info[num_refs].slotIndex = rsurf->dpb_index;
+      ref_info[num_refs].pPictureResource = &ref_res[num_refs];
+      num_refs++;
+   }
+
+   ref_std[num_refs].PicOrderCntVal = h265->CurrPicOrderCntVal;
+   ref_dpb[num_refs] = (VkVideoDecodeH265DpbSlotInfoKHR) {
+      .sType = VK_STRUCTURE_TYPE_VIDEO_DECODE_H265_DPB_SLOT_INFO_KHR,
+      .pStdReferenceInfo = &ref_std[num_refs],
+   };
+   ref_res[num_refs] = dpb_picture_resource(zvc, surf);
+   VkVideoReferenceSlotInfoKHR setup_info = { 0 };
+   setup_info.sType = VK_STRUCTURE_TYPE_VIDEO_REFERENCE_SLOT_INFO_KHR;
+   setup_info.pNext = &ref_dpb[num_refs];
+   setup_info.slotIndex = surf->dpb_index;
+   setup_info.pPictureResource = &ref_res[num_refs];
+   /* this must be added to the list of 'bound resources' */
+   ref_info[num_refs] = setup_info;
+   ref_info[num_refs].slotIndex = -1;
+
+   /* The parameter sets, which VA-API gives with each picture, of what the
+    * decoding of the picture needs. It doesn't give the reference picture
+    * sets of the SPS, which the pictures' own ones are given parsed instead
+    * of, nor the profile's level: the SPS has as many sets, empty, and the
+    * highest level.
+    */
+   StdVideoH265ProfileTierLevel ptl = { 0 };
+   ptl.flags.general_progressive_source_flag = 1;
+   ptl.flags.general_frame_only_constraint_flag = 1;
+   ptl.general_profile_idc = h265_profile_conv(codec->profile);
+   ptl.general_level_idc = STD_VIDEO_H265_LEVEL_IDC_6_2;
+
+   StdVideoH265DecPicBufMgr dpb_mgr = { 0 };
+   dpb_mgr.max_dec_pic_buffering_minus1[0] = psps->sps_max_dec_pic_buffering_minus1;
+
+   StdVideoH265VideoParameterSet vps = { 0 };
+   vps.flags.vps_temporal_id_nesting_flag = 1;
+   vps.pDecPicBufMgr = &dpb_mgr;
+   vps.pProfileTierLevel = &ptl;
+
+   StdVideoH265ScalingLists scaling = { 0 };
+   STATIC_ASSERT(sizeof(scaling.ScalingList4x4) == sizeof(psps->ScalingList4x4));
+   STATIC_ASSERT(sizeof(scaling.ScalingList8x8) == sizeof(psps->ScalingList8x8));
+   STATIC_ASSERT(sizeof(scaling.ScalingList16x16) == sizeof(psps->ScalingList16x16));
+   STATIC_ASSERT(sizeof(scaling.ScalingList32x32) == sizeof(psps->ScalingList32x32));
+   /* Both are in up-right diagonal scan order: the frontend reorders
+    * VA-API's raster scan lists.
+    */
+   memcpy(scaling.ScalingList4x4, psps->ScalingList4x4, sizeof(scaling.ScalingList4x4));
+   memcpy(scaling.ScalingList8x8, psps->ScalingList8x8, sizeof(scaling.ScalingList8x8));
+   memcpy(scaling.ScalingList16x16, psps->ScalingList16x16, sizeof(scaling.ScalingList16x16));
+   memcpy(scaling.ScalingList32x32, psps->ScalingList32x32, sizeof(scaling.ScalingList32x32));
+   memcpy(scaling.ScalingListDCCoef16x16, psps->ScalingListDCCoeff16x16,
+          sizeof(scaling.ScalingListDCCoef16x16));
+   memcpy(scaling.ScalingListDCCoef32x32, psps->ScalingListDCCoeff32x32,
+          sizeof(scaling.ScalingListDCCoef32x32));
+
+   StdVideoH265ShortTermRefPicSet st_rps[STD_VIDEO_H265_MAX_SHORT_TERM_REF_PIC_SETS] = { 0 };
+   StdVideoH265LongTermRefPicsSps lt_rps = { 0 };
+
+   StdVideoH265SequenceParameterSet sps = { 0 };
+   sps.flags.sps_temporal_id_nesting_flag = 1;
+   sps.flags.separate_colour_plane_flag = psps->separate_colour_plane_flag;
+   sps.flags.conformance_window_flag = 0;
+   sps.flags.scaling_list_enabled_flag = psps->scaling_list_enabled_flag;
+   /* VA-API gives the scaling lists the picture uses, the PPS's, the
+    * SPS's or the default ones: they are given as the SPS's.
+    */
+   sps.flags.sps_scaling_list_data_present_flag = psps->scaling_list_enabled_flag;
+   sps.flags.amp_enabled_flag = psps->amp_enabled_flag;
+   sps.flags.sample_adaptive_offset_enabled_flag = psps->sample_adaptive_offset_enabled_flag;
+   sps.flags.pcm_enabled_flag = psps->pcm_enabled_flag;
+   sps.flags.pcm_loop_filter_disabled_flag = psps->pcm_loop_filter_disabled_flag;
+   sps.flags.long_term_ref_pics_present_flag = psps->long_term_ref_pics_present_flag;
+   sps.flags.sps_temporal_mvp_enabled_flag = psps->sps_temporal_mvp_enabled_flag;
+   sps.flags.strong_intra_smoothing_enabled_flag = psps->strong_intra_smoothing_enabled_flag;
+   sps.chroma_format_idc = (StdVideoH265ChromaFormatIdc)psps->chroma_format_idc;
+   sps.pic_width_in_luma_samples = psps->pic_width_in_luma_samples;
+   sps.pic_height_in_luma_samples = psps->pic_height_in_luma_samples;
+   sps.bit_depth_luma_minus8 = psps->bit_depth_luma_minus8;
+   sps.bit_depth_chroma_minus8 = psps->bit_depth_chroma_minus8;
+   sps.log2_max_pic_order_cnt_lsb_minus4 = psps->log2_max_pic_order_cnt_lsb_minus4;
+   sps.log2_min_luma_coding_block_size_minus3 = psps->log2_min_luma_coding_block_size_minus3;
+   sps.log2_diff_max_min_luma_coding_block_size = psps->log2_diff_max_min_luma_coding_block_size;
+   sps.log2_min_luma_transform_block_size_minus2 = psps->log2_min_transform_block_size_minus2;
+   sps.log2_diff_max_min_luma_transform_block_size = psps->log2_diff_max_min_transform_block_size;
+   sps.max_transform_hierarchy_depth_inter = psps->max_transform_hierarchy_depth_inter;
+   sps.max_transform_hierarchy_depth_intra = psps->max_transform_hierarchy_depth_intra;
+   sps.num_short_term_ref_pic_sets = psps->num_short_term_ref_pic_sets;
+   sps.num_long_term_ref_pics_sps = psps->num_long_term_ref_pics_sps;
+   if (psps->pcm_enabled_flag) {
+      sps.pcm_sample_bit_depth_luma_minus1 = psps->pcm_sample_bit_depth_luma_minus1;
+      sps.pcm_sample_bit_depth_chroma_minus1 = psps->pcm_sample_bit_depth_chroma_minus1;
+      sps.log2_min_pcm_luma_coding_block_size_minus3 = psps->log2_min_pcm_luma_coding_block_size_minus3;
+      sps.log2_diff_max_min_pcm_luma_coding_block_size = psps->log2_diff_max_min_pcm_luma_coding_block_size;
+   }
+   sps.pProfileTierLevel = &ptl;
+   sps.pDecPicBufMgr = &dpb_mgr;
+   sps.pScalingLists = psps->scaling_list_enabled_flag ? &scaling : NULL;
+   sps.pShortTermRefPicSet = psps->num_short_term_ref_pic_sets ? st_rps : NULL;
+   sps.pLongTermRefPicsSps = psps->long_term_ref_pics_present_flag ? &lt_rps : NULL;
+
+   StdVideoH265PictureParameterSet pps = { 0 };
+   pps.flags.dependent_slice_segments_enabled_flag = ppps->dependent_slice_segments_enabled_flag;
+   pps.flags.output_flag_present_flag = ppps->output_flag_present_flag;
+   pps.flags.sign_data_hiding_enabled_flag = ppps->sign_data_hiding_enabled_flag;
+   pps.flags.cabac_init_present_flag = ppps->cabac_init_present_flag;
+   pps.flags.constrained_intra_pred_flag = ppps->constrained_intra_pred_flag;
+   pps.flags.transform_skip_enabled_flag = ppps->transform_skip_enabled_flag;
+   pps.flags.cu_qp_delta_enabled_flag = ppps->cu_qp_delta_enabled_flag;
+   pps.flags.pps_slice_chroma_qp_offsets_present_flag = ppps->pps_slice_chroma_qp_offsets_present_flag;
+   pps.flags.weighted_pred_flag = ppps->weighted_pred_flag;
+   pps.flags.weighted_bipred_flag = ppps->weighted_bipred_flag;
+   pps.flags.transquant_bypass_enabled_flag = ppps->transquant_bypass_enabled_flag;
+   pps.flags.tiles_enabled_flag = ppps->tiles_enabled_flag;
+   pps.flags.entropy_coding_sync_enabled_flag = ppps->entropy_coding_sync_enabled_flag;
+   /* VA-API gives the size of every tile column and row but the last,
+    * uniformly spaced or not.
+    */
+   pps.flags.uniform_spacing_flag = 0;
+   pps.flags.loop_filter_across_tiles_enabled_flag = ppps->loop_filter_across_tiles_enabled_flag;
+   pps.flags.pps_loop_filter_across_slices_enabled_flag = ppps->pps_loop_filter_across_slices_enabled_flag;
+   /* VA-API doesn't say whether the PPS has the deblocking filter control
+    * syntax: it has if anything of it isn't of its default.
+    */
+   pps.flags.deblocking_filter_control_present_flag =
+      ppps->deblocking_filter_override_enabled_flag ||
+      ppps->pps_deblocking_filter_disabled_flag ||
+      ppps->pps_beta_offset_div2 || ppps->pps_tc_offset_div2;
+   pps.flags.deblocking_filter_override_enabled_flag = ppps->deblocking_filter_override_enabled_flag;
+   pps.flags.pps_deblocking_filter_disabled_flag = ppps->pps_deblocking_filter_disabled_flag;
+   pps.flags.pps_scaling_list_data_present_flag = 0;
+   pps.flags.lists_modification_present_flag = ppps->lists_modification_present_flag;
+   pps.flags.slice_segment_header_extension_present_flag = ppps->slice_segment_header_extension_present_flag;
+   pps.num_extra_slice_header_bits = ppps->num_extra_slice_header_bits;
+   pps.num_ref_idx_l0_default_active_minus1 = ppps->num_ref_idx_l0_default_active_minus1;
+   pps.num_ref_idx_l1_default_active_minus1 = ppps->num_ref_idx_l1_default_active_minus1;
+   pps.init_qp_minus26 = ppps->init_qp_minus26;
+   pps.diff_cu_qp_delta_depth = ppps->diff_cu_qp_delta_depth;
+   pps.pps_cb_qp_offset = ppps->pps_cb_qp_offset;
+   pps.pps_cr_qp_offset = ppps->pps_cr_qp_offset;
+   pps.pps_beta_offset_div2 = ppps->pps_beta_offset_div2;
+   pps.pps_tc_offset_div2 = ppps->pps_tc_offset_div2;
+   pps.log2_parallel_merge_level_minus2 = ppps->log2_parallel_merge_level_minus2;
+   if (ppps->tiles_enabled_flag) {
+      pps.num_tile_columns_minus1 = ppps->num_tile_columns_minus1;
+      pps.num_tile_rows_minus1 = ppps->num_tile_rows_minus1;
+      for (unsigned i = 0; i < ARRAY_SIZE(pps.column_width_minus1); i++)
+         pps.column_width_minus1[i] = ppps->column_width_minus1[i];
+      for (unsigned i = 0; i < ARRAY_SIZE(pps.row_height_minus1); i++)
+         pps.row_height_minus1[i] = ppps->row_height_minus1[i];
+   }
+
+   VkVideoDecodeH265SessionParametersAddInfoKHR h265add = { 0 };
+   h265add.sType = VK_STRUCTURE_TYPE_VIDEO_DECODE_H265_SESSION_PARAMETERS_ADD_INFO_KHR;
+   h265add.stdVPSCount = 1;
+   h265add.pStdVPSs = &vps;
+   h265add.stdSPSCount = 1;
+   h265add.pStdSPSs = &sps;
+   h265add.stdPPSCount = 1;
+   h265add.pStdPPSs = &pps;
+
+   VkVideoDecodeH265SessionParametersCreateInfoKHR h265_create = { 0 };
+   h265_create.sType = VK_STRUCTURE_TYPE_VIDEO_DECODE_H265_SESSION_PARAMETERS_CREATE_INFO_KHR;
+   h265_create.maxStdVPSCount = 1;
+   h265_create.maxStdSPSCount = 1;
+   h265_create.maxStdPPSCount = 1;
+   h265_create.pParametersAddInfo = &h265add;
+   VkVideoSessionParametersCreateInfoKHR pci = { 0 };
+   pci.sType = VK_STRUCTURE_TYPE_VIDEO_SESSION_PARAMETERS_CREATE_INFO_KHR;
+   pci.pNext = &h265_create;
+   pci.videoSession = zvc->session;
+   VKSCR(CreateVideoSessionParametersKHR)(screen->dev, &pci, NULL, &zvc->params);
+
+   VkCommandBuffer cmdbuf = ctx->bs->cmdbuf;
+
+   if (zvc->coincide_dpb) {
+      for (unsigned i = 0; i < ARRAY_SIZE(h265->ref); i++) {
+         if (ref_surfs[i])
+            video_image_barrier(ctx, cmdbuf, video_buffer_resource(h265->ref[i]),
+                                VK_IMAGE_LAYOUT_VIDEO_DECODE_DPB_KHR, false);
+      }
+      video_image_barrier(ctx, cmdbuf, video_buffer_resource(target), VK_IMAGE_LAYOUT_VIDEO_DECODE_DPB_KHR, true);
+   } else {
+      if (zvc->dpb_array) {
+         video_image_barrier(ctx, cmdbuf, zink_resource(zvc->dpb_res[0]), VK_IMAGE_LAYOUT_VIDEO_DECODE_DPB_KHR, true);
+      } else {
+         for (unsigned i = 0; i < ARRAY_SIZE(h265->ref); i++) {
+            if (ref_surfs[i])
+               video_image_barrier(ctx, cmdbuf, zink_resource(zvc->dpb_res[ref_surfs[i]->dpb_index]),
+                                   VK_IMAGE_LAYOUT_VIDEO_DECODE_DPB_KHR, false);
+         }
+         video_image_barrier(ctx, cmdbuf, zink_resource(zvc->dpb_res[surf->dpb_index]), VK_IMAGE_LAYOUT_VIDEO_DECODE_DPB_KHR, true);
+      }
+      video_image_barrier(ctx, cmdbuf, video_buffer_resource(target), VK_IMAGE_LAYOUT_VIDEO_DECODE_DST_KHR, true);
+   }
+
+   VkVideoBeginCodingInfoKHR bci = { 0 };
+   bci.sType = VK_STRUCTURE_TYPE_VIDEO_BEGIN_CODING_INFO_KHR;
+   bci.videoSession = zvc->session;
+   bci.videoSessionParameters = zvc->params;
+   bci.referenceSlotCount = num_refs + 1;
+   bci.pReferenceSlots = ref_info;
+
+   VKSCR(CmdBeginVideoCodingKHR)(cmdbuf, &bci);
+
+   if (!zvc->reset_sent) {
+      VkVideoCodingControlInfoKHR cc = {0};
+      cc.sType = VK_STRUCTURE_TYPE_VIDEO_CODING_CONTROL_INFO_KHR;
+      cc.flags = VK_VIDEO_CODING_CONTROL_RESET_BIT_KHR;
+      VKSCR(CmdControlVideoCodingKHR)(cmdbuf, &cc);
+      zvc->reset_sent = true;
+   }
+
+   struct zink_resource *zbs = zvc->bitstream_res;
+   VkBufferMemoryBarrier2KHR bitstream_bmb;
+   bitstream_bmb.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2_KHR;
+   bitstream_bmb.pNext = NULL;
+   bitstream_bmb.srcStageMask = VK_PIPELINE_STAGE_2_HOST_BIT_KHR;
+   bitstream_bmb.srcAccessMask = VK_ACCESS_2_HOST_WRITE_BIT_KHR;
+   bitstream_bmb.dstStageMask = VK_PIPELINE_STAGE_2_VIDEO_DECODE_BIT_KHR;
+   bitstream_bmb.dstAccessMask = VK_ACCESS_2_VIDEO_DECODE_READ_BIT_KHR;
+   bitstream_bmb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+   bitstream_bmb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+   bitstream_bmb.buffer = zbs->obj->buffer;
+   bitstream_bmb.size = zvc->bs_range;
+   bitstream_bmb.offset = zvc->bs_offset;
+
+   VkDependencyInfoKHR di = { 0 };
+   di.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR;
+   di.dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT;
+   di.bufferMemoryBarrierCount = 1;
+   di.pBufferMemoryBarriers = &bitstream_bmb;
+   VKSCR(CmdPipelineBarrier2KHR)(cmdbuf, &di);
+
+   /* The reference picture sets, by DPB slot. */
+   StdVideoDecodeH265PictureInfo pi = { 0 };
+   const struct {
+      uint8_t *slots;
+      const uint8_t *refs;
+      unsigned count;
+   } sets[] = {
+      { pi.RefPicSetStCurrBefore, h265->RefPicSetStCurrBefore, h265->NumPocStCurrBefore },
+      { pi.RefPicSetStCurrAfter, h265->RefPicSetStCurrAfter, h265->NumPocStCurrAfter },
+      { pi.RefPicSetLtCurr, h265->RefPicSetLtCurr, h265->NumPocLtCurr },
+   };
+   for (unsigned s = 0; s < ARRAY_SIZE(sets); s++) {
+      memset(sets[s].slots, 0xff, STD_VIDEO_DECODE_H265_REF_PIC_SET_LIST_SIZE);
+      unsigned n = 0;
+      for (unsigned i = 0; i < MIN2(sets[s].count, STD_VIDEO_DECODE_H265_REF_PIC_SET_LIST_SIZE); i++) {
+         const uint8_t ref = sets[s].refs[i];
+         if (ref < ARRAY_SIZE(ref_surfs) && ref_surfs[ref])
+            sets[s].slots[n++] = ref_surfs[ref]->dpb_index;
+      }
+   }
+   pi.flags.IrapPicFlag = h265->RAPPicFlag;
+   pi.flags.IdrPicFlag = h265->IDRPicFlag;
+   /* VA-API doesn't say whether the picture is a reference */
+   pi.flags.IsReference = 1;
+   /* The bits of the slice segment headers' short-term reference picture
+    * set, which they only have when they don't take one of the SPS's.
+    */
+   pi.flags.short_term_ref_pic_set_sps_flag =
+      !h265->IDRPicFlag && h265->NumShortTermPictureSliceHeaderBits == 0;
+   pi.NumBitsForSTRefPicSetInSlice = h265->NumShortTermPictureSliceHeaderBits;
+   pi.NumDeltaPocsOfRefRpsIdx = h265->NumDeltaPocsOfRefRpsIdx;
+   pi.PicOrderCntVal = h265->CurrPicOrderCntVal;
+
+   uint32_t slice_offsets[PIPE_H265_MAX_SLICES];
+   VkVideoDecodeH265PictureInfoKHR hpi = { 0 };
+   hpi.sType = VK_STRUCTURE_TYPE_VIDEO_DECODE_H265_PICTURE_INFO_KHR;
+   hpi.pStdPictureInfo = &pi;
+   hpi.sliceSegmentCount = h265_slice_segment_offsets(zvc, slice_offsets,
+                                                      ARRAY_SIZE(slice_offsets));
+   hpi.pSliceSegmentOffsets = slice_offsets;
+
+   VkVideoDecodeInfoKHR vdi = { 0 };
+   vdi.sType = VK_STRUCTURE_TYPE_VIDEO_DECODE_INFO_KHR;
+   vdi.pNext = &hpi;
+   vdi.referenceSlotCount = num_refs;
+   vdi.pReferenceSlots = ref_info;
+   vdi.pSetupReferenceSlot = &setup_info;
+   vdi.dstPictureResource = surf->resource;
+   vdi.srcBuffer = zbs->obj->buffer;
+   vdi.srcBufferOffset = zvc->bs_offset;
+   vdi.srcBufferRange = zvc->bs_range;
+   VKSCR(CmdDecodeVideoKHR)(cmdbuf, &vdi);
+
+   end_coding(ctx, zvc, cmdbuf, picture->out_fence, picture->flush_flags);
+
+   return 0;
+}
+
 /* Whether the driver applies the film grain of AV1 frames, which the
  * profile of the codec, and those of the pictures, then say.
  */
@@ -1810,6 +2201,9 @@ zink_create_video_codec(struct pipe_context *pctx, const struct pipe_video_codec
    zvc->base.decode_macroblock = zink_decode_macroblock;
    zvc->base.decode_bitstream = zink_decode_bitstream;
    switch (u_reduce_video_profile(templat->profile)) {
+   case PIPE_VIDEO_FORMAT_HEVC:
+      zvc->base.end_frame = zink_end_frame_h265;
+      break;
    case PIPE_VIDEO_FORMAT_VP9:
       zvc->base.end_frame = zink_end_frame_vp9;
       break;
@@ -1900,6 +2294,8 @@ convert_decode_op(enum pipe_video_format vid_format)
    switch (vid_format) {
    case PIPE_VIDEO_FORMAT_MPEG4_AVC:
       return VK_VIDEO_CODEC_OPERATION_DECODE_H264_BIT_KHR;
+   case PIPE_VIDEO_FORMAT_HEVC:
+      return VK_VIDEO_CODEC_OPERATION_DECODE_H265_BIT_KHR;
    case PIPE_VIDEO_FORMAT_VP9:
       return VK_VIDEO_CODEC_OPERATION_DECODE_VP9_BIT_KHR;
    case PIPE_VIDEO_FORMAT_AV1:
@@ -1931,6 +2327,9 @@ zink_video_fill_single_profile(struct zink_screen *screen,
    if (vid_format == PIPE_VIDEO_FORMAT_MPEG4_AVC &&
        !screen->info.have_KHR_video_decode_h264)
       return false;
+   if (vid_format == PIPE_VIDEO_FORMAT_HEVC &&
+       !screen->info.have_KHR_video_decode_h265)
+      return false;
    if (vid_format == PIPE_VIDEO_FORMAT_VP9 &&
        !screen->info.have_KHR_video_decode_vp9)
       return false;
@@ -1951,6 +2350,11 @@ zink_video_fill_single_profile(struct zink_screen *screen,
       out_prof->h264.stdProfileIdc = h264_profile_conv(profile);
       out_prof->h264.pictureLayout = VK_VIDEO_DECODE_H264_PICTURE_LAYOUT_PROGRESSIVE_KHR;
       out_prof->profile.pNext = &out_prof->h264;
+      break;
+   case PIPE_VIDEO_FORMAT_HEVC:
+      out_prof->h265.sType = VK_STRUCTURE_TYPE_VIDEO_DECODE_H265_PROFILE_INFO_KHR;
+      out_prof->h265.stdProfileIdc = h265_profile_conv(profile);
+      out_prof->profile.pNext = &out_prof->h265;
       break;
    case PIPE_VIDEO_FORMAT_VP9:
       out_prof->vp9.sType = VK_STRUCTURE_TYPE_VIDEO_DECODE_VP9_PROFILE_INFO_KHR;
@@ -1985,6 +2389,18 @@ zink_video_fill_profiles(struct zink_screen *screen,
          profile = PIPE_VIDEO_PROFILE_MPEG4_AVC_HIGH;
       if (zink_video_fill_single_profile(screen, profile, luma_depth, &profiles->h264)) {
          profiles->profiles[profile_count] = profiles->h264.profile;
+         profile_count++;
+      }
+   }
+
+   if (screen->info.have_KHR_video_decode_h265 && (vid_format == PIPE_VIDEO_FORMAT_HEVC ||
+                                                   vid_format == PIPE_VIDEO_FORMAT_UNKNOWN)) {
+      enum pipe_video_profile h265_profile = profile;
+      if (vid_format == PIPE_VIDEO_FORMAT_UNKNOWN)
+         h265_profile = luma_depth > 8 ? PIPE_VIDEO_PROFILE_HEVC_MAIN_10 :
+                                         PIPE_VIDEO_PROFILE_HEVC_MAIN;
+      if (zink_video_fill_single_profile(screen, h265_profile, luma_depth, &profiles->h265)) {
+         profiles->profiles[profile_count] = profiles->h265.profile;
          profile_count++;
       }
    }
@@ -2040,6 +2456,10 @@ zink_video_fill_caps(struct zink_screen *screen,
    caps_info->dec_caps.sType = VK_STRUCTURE_TYPE_VIDEO_DECODE_CAPABILITIES_KHR;
 
    switch (u_reduce_video_profile(profile)) {
+   case PIPE_VIDEO_FORMAT_HEVC:
+      caps_info->dec_caps.pNext = &caps_info->h265_dec_caps;
+      caps_info->h265_dec_caps.sType = VK_STRUCTURE_TYPE_VIDEO_DECODE_H265_CAPABILITIES_KHR;
+      break;
    case PIPE_VIDEO_FORMAT_VP9:
       caps_info->dec_caps.pNext = &caps_info->vp9_dec_caps;
       caps_info->vp9_dec_caps.sType = VK_STRUCTURE_TYPE_VIDEO_DECODE_VP9_CAPABILITIES_KHR;

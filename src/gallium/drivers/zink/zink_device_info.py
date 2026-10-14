@@ -367,6 +367,7 @@ EXTENSIONS = [
     Extension("VK_KHR_video_queue"),
     Extension("VK_KHR_video_decode_queue"),
     Extension("VK_KHR_video_decode_h264"),
+    Extension("VK_KHR_video_decode_h265"),
     Extension("VK_KHR_video_decode_vp9",
               alias="video_decode_vp9",
               features=True,
