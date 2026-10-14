@@ -577,19 +577,26 @@ end_coding(struct zink_context *ctx,
    zink_resource_reference(&zvc->bitstream_res, NULL);
 }
 
+/* Has the decode access res in layout, writing it if write: the decoded
+ * picture's images are written, its references only read. Images from another
+ * queue are used once the writers of their dma-buf are done, and the readers
+ * too for a write, as implicit sync wants.
+ */
 static void
-video_image_barrier(struct zink_context *ctx, VkCommandBuffer cmdbuf, struct zink_resource *res, VkImageLayout layout)
+video_image_barrier(struct zink_context *ctx, VkCommandBuffer cmdbuf, struct zink_resource *res, VkImageLayout layout,
+                    bool write)
 {
    struct zink_screen *screen = zink_screen(ctx->base.screen);
    bool is_foreign = false;
    bool needs_barrier = false;
    bool same_layout = true;
-   zink_batch_reference_resource_rw(ctx, res, true);
+   zink_batch_reference_resource_rw(ctx, res, write);
    for (struct zink_resource *plane = res; plane; plane = zink_resource(plane->base.b.next)) {
       is_foreign |= plane->queue == VK_QUEUE_FAMILY_FOREIGN_EXT;
       needs_barrier |= plane->layout != layout;
       same_layout &= plane->layout == res->layout;
    }
+   /* the dma-buf's fences are waited for when the batch ends (zink_end_batch()) */
    if (!needs_barrier && !is_foreign)
       return;
 
@@ -762,19 +769,19 @@ zink_end_frame_h264(struct pipe_video_codec *codec,
 
    if (zvc->coincide_dpb) {
       for (unsigned i = 0; i < h264->num_ref_frames && h264->ref[i]; i++)
-         video_image_barrier(ctx, cmdbuf, video_buffer_resource(h264->ref[i]), VK_IMAGE_LAYOUT_VIDEO_DECODE_DPB_KHR);
-      video_image_barrier(ctx, cmdbuf, video_buffer_resource(target), VK_IMAGE_LAYOUT_VIDEO_DECODE_DPB_KHR);
+         video_image_barrier(ctx, cmdbuf, video_buffer_resource(h264->ref[i]), VK_IMAGE_LAYOUT_VIDEO_DECODE_DPB_KHR, false);
+      video_image_barrier(ctx, cmdbuf, video_buffer_resource(target), VK_IMAGE_LAYOUT_VIDEO_DECODE_DPB_KHR, true);
    } else {
       if (zvc->dpb_array) {
-         video_image_barrier(ctx, cmdbuf, zink_resource(zvc->dpb_res[0]), VK_IMAGE_LAYOUT_VIDEO_DECODE_DPB_KHR);
+         video_image_barrier(ctx, cmdbuf, zink_resource(zvc->dpb_res[0]), VK_IMAGE_LAYOUT_VIDEO_DECODE_DPB_KHR, true);
       } else {
          for (unsigned i = 0; i < h264->num_ref_frames && h264->ref[i]; i++) {
             struct zink_video_surf_data *rsurf = vl_video_buffer_get_associated_data(h264->ref[i], &zvc->base);
-            video_image_barrier(ctx, cmdbuf, zink_resource(zvc->dpb_res[rsurf->dpb_index]), VK_IMAGE_LAYOUT_VIDEO_DECODE_DPB_KHR);
+            video_image_barrier(ctx, cmdbuf, zink_resource(zvc->dpb_res[rsurf->dpb_index]), VK_IMAGE_LAYOUT_VIDEO_DECODE_DPB_KHR, false);
          }
-         video_image_barrier(ctx, cmdbuf, zink_resource(zvc->dpb_res[surf->dpb_index]), VK_IMAGE_LAYOUT_VIDEO_DECODE_DPB_KHR);
+         video_image_barrier(ctx, cmdbuf, zink_resource(zvc->dpb_res[surf->dpb_index]), VK_IMAGE_LAYOUT_VIDEO_DECODE_DPB_KHR, true);
       }
-      video_image_barrier(ctx, cmdbuf, video_buffer_resource(target), VK_IMAGE_LAYOUT_VIDEO_DECODE_DST_KHR);
+      video_image_barrier(ctx, cmdbuf, video_buffer_resource(target), VK_IMAGE_LAYOUT_VIDEO_DECODE_DST_KHR, true);
    }
 
    VkVideoBeginCodingInfoKHR bci = { 0 };
@@ -1036,21 +1043,21 @@ zink_end_frame_vp9(struct pipe_video_codec *codec,
       for (unsigned i = 0; i < STD_VIDEO_VP9_REFS_PER_FRAME; i++) {
          if (ref_surfs[i])
             video_image_barrier(ctx, cmdbuf, video_buffer_resource(vp9->ref[ref_frames[i]]),
-                                VK_IMAGE_LAYOUT_VIDEO_DECODE_DPB_KHR);
+                                VK_IMAGE_LAYOUT_VIDEO_DECODE_DPB_KHR, false);
       }
-      video_image_barrier(ctx, cmdbuf, video_buffer_resource(target), VK_IMAGE_LAYOUT_VIDEO_DECODE_DPB_KHR);
+      video_image_barrier(ctx, cmdbuf, video_buffer_resource(target), VK_IMAGE_LAYOUT_VIDEO_DECODE_DPB_KHR, true);
    } else {
       if (zvc->dpb_array) {
-         video_image_barrier(ctx, cmdbuf, zink_resource(zvc->dpb_res[0]), VK_IMAGE_LAYOUT_VIDEO_DECODE_DPB_KHR);
+         video_image_barrier(ctx, cmdbuf, zink_resource(zvc->dpb_res[0]), VK_IMAGE_LAYOUT_VIDEO_DECODE_DPB_KHR, true);
       } else {
          for (unsigned i = 0; i < STD_VIDEO_VP9_REFS_PER_FRAME; i++) {
             if (ref_surfs[i])
                video_image_barrier(ctx, cmdbuf, zink_resource(zvc->dpb_res[ref_surfs[i]->dpb_index]),
-                                   VK_IMAGE_LAYOUT_VIDEO_DECODE_DPB_KHR);
+                                   VK_IMAGE_LAYOUT_VIDEO_DECODE_DPB_KHR, false);
          }
-         video_image_barrier(ctx, cmdbuf, zink_resource(zvc->dpb_res[surf->dpb_index]), VK_IMAGE_LAYOUT_VIDEO_DECODE_DPB_KHR);
+         video_image_barrier(ctx, cmdbuf, zink_resource(zvc->dpb_res[surf->dpb_index]), VK_IMAGE_LAYOUT_VIDEO_DECODE_DPB_KHR, true);
       }
-      video_image_barrier(ctx, cmdbuf, video_buffer_resource(target), VK_IMAGE_LAYOUT_VIDEO_DECODE_DST_KHR);
+      video_image_barrier(ctx, cmdbuf, video_buffer_resource(target), VK_IMAGE_LAYOUT_VIDEO_DECODE_DST_KHR, true);
    }
 
    VkVideoBeginCodingInfoKHR bci = { 0 };
@@ -1490,23 +1497,23 @@ zink_end_frame_av1(struct pipe_video_codec *codec,
       for (unsigned i = 0; i < STD_VIDEO_AV1_REFS_PER_FRAME; i++) {
          if (ref_surfs[i])
             video_image_barrier(ctx, cmdbuf, video_buffer_resource(av1->ref[av1->picture_parameter.ref_frame_idx[i]]),
-                                VK_IMAGE_LAYOUT_VIDEO_DECODE_DPB_KHR);
+                                VK_IMAGE_LAYOUT_VIDEO_DECODE_DPB_KHR, false);
       }
-      video_image_barrier(ctx, cmdbuf, video_buffer_resource(target), VK_IMAGE_LAYOUT_VIDEO_DECODE_DPB_KHR);
+      video_image_barrier(ctx, cmdbuf, video_buffer_resource(target), VK_IMAGE_LAYOUT_VIDEO_DECODE_DPB_KHR, true);
       if (decoder_grain)
-         video_image_barrier(ctx, cmdbuf, video_buffer_resource(output), VK_IMAGE_LAYOUT_VIDEO_DECODE_DST_KHR);
+         video_image_barrier(ctx, cmdbuf, video_buffer_resource(output), VK_IMAGE_LAYOUT_VIDEO_DECODE_DST_KHR, true);
    } else {
       if (zvc->dpb_array) {
-         video_image_barrier(ctx, cmdbuf, zink_resource(zvc->dpb_res[0]), VK_IMAGE_LAYOUT_VIDEO_DECODE_DPB_KHR);
+         video_image_barrier(ctx, cmdbuf, zink_resource(zvc->dpb_res[0]), VK_IMAGE_LAYOUT_VIDEO_DECODE_DPB_KHR, true);
       } else {
          for (unsigned i = 0; i < STD_VIDEO_AV1_REFS_PER_FRAME; i++) {
             if (ref_surfs[i])
                video_image_barrier(ctx, cmdbuf, zink_resource(zvc->dpb_res[ref_surfs[i]->dpb_index]),
-                                   VK_IMAGE_LAYOUT_VIDEO_DECODE_DPB_KHR);
+                                   VK_IMAGE_LAYOUT_VIDEO_DECODE_DPB_KHR, false);
          }
-         video_image_barrier(ctx, cmdbuf, zink_resource(zvc->dpb_res[surf->dpb_index]), VK_IMAGE_LAYOUT_VIDEO_DECODE_DPB_KHR);
+         video_image_barrier(ctx, cmdbuf, zink_resource(zvc->dpb_res[surf->dpb_index]), VK_IMAGE_LAYOUT_VIDEO_DECODE_DPB_KHR, true);
       }
-      video_image_barrier(ctx, cmdbuf, video_buffer_resource(output), VK_IMAGE_LAYOUT_VIDEO_DECODE_DST_KHR);
+      video_image_barrier(ctx, cmdbuf, video_buffer_resource(output), VK_IMAGE_LAYOUT_VIDEO_DECODE_DST_KHR, true);
    }
 
    VkVideoBeginCodingInfoKHR bci = { 0 };
