@@ -22,6 +22,14 @@ unsafe fn nv_push_append_push(p: *mut ffi::nv_push, push: Push) {
         assert!(new_end <= p.limit);
 
         std::ptr::copy_nonoverlapping(push.as_ptr(), p.end, push.len());
+
+        // The C push helpers look at the last method header, for instance to
+        // know which subchannel was used last. It is now the last header of
+        // the methods just copied.
+        if let Some(hdr) = push.last_hdr() {
+            p.last_hdr = p.end.add(hdr);
+            p.last_hdr_dw = push[hdr];
+        }
         p.end = new_end;
     }
 }

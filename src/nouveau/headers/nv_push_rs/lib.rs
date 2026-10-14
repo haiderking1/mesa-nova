@@ -120,6 +120,8 @@ pub struct Push {
     mem: Vec<u32>,
     /// Last DW that is an incrementing type or usize::MAX
     last_inc: usize,
+    /// Last DW that is a method header of any type
+    last_hdr: Option<usize>,
 }
 
 impl Push {
@@ -128,7 +130,19 @@ impl Push {
         Self {
             mem: Vec::new(),
             last_inc: usize::MAX,
+            last_hdr: None,
         }
+    }
+
+    /// Returns the index of the last method header in the push buffer, if
+    /// there is one.
+    pub fn last_hdr(&self) -> Option<usize> {
+        self.last_hdr
+    }
+
+    fn push_hdr(&mut self, header: MthdHeader) {
+        self.last_hdr = Some(self.mem.len());
+        self.mem.push(header.into_bits());
     }
 
     pub fn push_mthd_bits(&mut self, subc: u8, addr: u16, bits: u32) {
@@ -184,11 +198,11 @@ impl Push {
         if bits <= 0x1fff {
             self.last_inc = usize::MAX;
             let header = MthdHeader::new_immd(bits as u16, subc, addr);
-            self.mem.push(header.into_bits());
+            self.push_hdr(header);
         } else {
             self.last_inc = self.mem.len();
             let header = MthdHeader::new(MthdType::NInc, subc, addr, 1);
-            self.mem.push(header.into_bits());
+            self.push_hdr(header);
             self.mem.push(bits);
         }
     }
@@ -208,7 +222,7 @@ impl Push {
             M::ADDR,
             1,
         );
-        self.mem.push(header.into_bits());
+        self.push_hdr(header);
         self.mem.push(mthd.to_bits());
         self.mem.len() - 1
     }
@@ -223,7 +237,7 @@ impl Push {
             M::ADDR,
             0,
         );
-        self.mem.push(header.into_bits());
+        self.push_hdr(header);
     }
 
     pub fn push_mthd_1inc<M: Mthd>(&mut self, mthd: M) {
@@ -234,7 +248,7 @@ impl Push {
             M::ADDR,
             0,
         );
-        self.mem.push(header.into_bits());
+        self.push_hdr(header);
         self.mem.push(mthd.to_bits());
     }
 
@@ -256,7 +270,7 @@ impl Push {
             M::addr(i),
             0,
         );
-        self.mem.push(header.into_bits());
+        self.push_hdr(header);
     }
 
     pub fn push_array_mthd_1inc<M: ArrayMthd>(&mut self, i: usize, mthd: M) {
@@ -267,7 +281,7 @@ impl Push {
             M::addr(i),
             1,
         );
-        self.mem.push(header.into_bits());
+        self.push_hdr(header);
         self.mem.push(mthd.to_bits());
     }
 
