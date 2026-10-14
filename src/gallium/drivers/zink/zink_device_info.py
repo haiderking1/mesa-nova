@@ -367,6 +367,10 @@ EXTENSIONS = [
     Extension("VK_KHR_video_queue"),
     Extension("VK_KHR_video_decode_queue"),
     Extension("VK_KHR_video_decode_h264"),
+    Extension("VK_KHR_video_decode_vp9",
+              alias="video_decode_vp9",
+              features=True,
+              conditions=["$feats.videoDecodeVP9"]),
 ]
 
 # constructor: Versions(device_version(major, minor, patch), struct_version(major, minor))

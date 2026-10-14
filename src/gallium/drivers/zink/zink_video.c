@@ -78,10 +78,9 @@ zink_destroy_video_codec(struct pipe_video_codec *codec) {
    for (unsigned i = 0; i < zvc->num_priv_mems; i++)
       zink_bo_unref(screen, zvc->priv_mems[i]);
 
-   for (unsigned i = 0; i < 17; i++) {
-      if (zvc->render_pic_list[i])
-         vl_video_buffer_set_associated_data(zvc->render_pic_list[i], &zvc->base, NULL, NULL);
-   }
+   /* The pictures keep their data, which other codecs may use, and which is
+    * freed with them: see picture_data().
+    */
    /* ensure session is no longer in use */
    VKSCR(QueueWaitIdle)(screen->queue_video_decode);
    VKSCR(DestroyVideoSessionKHR)(screen->dev,
@@ -121,11 +120,13 @@ zink_video_create_session(struct zink_video_codec *zvc,
    struct zink_screen *screen = (struct zink_screen *)zvc->base.context->screen;
    uint32_t bit_depth = zink_video_get_format_bit_depth(format);
    struct zink_video_profile vk_profile = { 0 };
+   enum pipe_video_format vid_format = u_reduce_video_profile(profile);
    /* VA creates surfaces before the stream profile is known, but the profile
     * must be specified at image creation. HIGH profile is most compatible, so
     * use that for now
     */
-   profile = PIPE_VIDEO_PROFILE_MPEG4_AVC_HIGH;
+   if (vid_format == PIPE_VIDEO_FORMAT_MPEG4_AVC)
+      profile = PIPE_VIDEO_PROFILE_MPEG4_AVC_HIGH;
    zink_video_fill_single_profile(screen, profile, bit_depth, &vk_profile);
 
    struct zink_video_caps_info caps_info = { 0 };
@@ -190,6 +191,10 @@ zink_video_create_session(struct zink_video_codec *zvc,
       VK_STD_VULKAN_VIDEO_CODEC_H264_DECODE_EXTENSION_NAME,
       VK_STD_VULKAN_VIDEO_CODEC_H264_DECODE_SPEC_VERSION
    };
+   const VkExtensionProperties vp9_props = {
+      VK_STD_VULKAN_VIDEO_CODEC_VP9_DECODE_EXTENSION_NAME,
+      VK_STD_VULKAN_VIDEO_CODEC_VP9_DECODE_SPEC_VERSION
+   };
 
    VkVideoSessionCreateInfoKHR sci = { 0 };
    sci.sType = VK_STRUCTURE_TYPE_VIDEO_SESSION_CREATE_INFO_KHR;
@@ -201,7 +206,8 @@ zink_video_create_session(struct zink_video_codec *zvc,
    sci.referencePictureFormat = zink_get_format(screen, format);
    sci.maxActiveReferencePictures = caps_info.caps.maxActiveReferencePictures;
    sci.maxDpbSlots = caps_info.caps.maxDpbSlots;
-   sci.pStdHeaderVersion = &h264_props;
+   sci.pStdHeaderVersion =
+      vid_format == PIPE_VIDEO_FORMAT_VP9 ? &vp9_props : &h264_props;
 
    VKSCR(CreateVideoSessionKHR)(screen->dev, &sci, NULL, &zvc->session);
 
@@ -399,6 +405,9 @@ convert_pps_sps(struct pipe_picture_desc *picture,
    vsps->pic_height_in_map_units_minus1 = sps->pic_height_in_mbs_minus1;
 }
 
+/* The serial of the last picture data created */
+static uint64_t surf_serial;
+
 static struct zink_video_surf_data *
 create_surf(struct zink_video_codec *zvc,
             struct pipe_video_buffer *target,
@@ -409,6 +418,7 @@ create_surf(struct zink_video_codec *zvc,
    struct zink_video_surf_data *surf = calloc(sizeof(*surf), 1);
 
    surf->screen = screen;
+   surf->serial = p_atomic_inc_return(&surf_serial);
    surf->resource.sType = VK_STRUCTURE_TYPE_VIDEO_PICTURE_RESOURCE_INFO_KHR;
    surf->resource.pNext = NULL;
    surf->resource.codedExtent.width = target->width;
@@ -755,6 +765,323 @@ zink_end_frame_h264(struct pipe_video_codec *codec,
    return 0;
 }
 
+/* The segmentation features of VP9, as FeatureEnabled and FeatureData take
+ * them.
+ */
+enum vp9_seg_lvl {
+   VP9_SEG_LVL_ALT_Q,
+   VP9_SEG_LVL_ALT_L,
+   VP9_SEG_LVL_REF_FRAME,
+   VP9_SEG_LVL_SKIP,
+};
+
+/* The data zink keeps with a picture: its view and the size of the frame
+ * decoded to it. It belongs to the picture, not to the codec which decoded
+ * it, as a picture may be the reference of a frame another codec decodes:
+ * VA-API decoders are created again when a VP9 stream changes size, with the
+ * pictures of the old size as references.
+ */
+static struct zink_video_surf_data *
+picture_data(struct pipe_video_buffer *buf)
+{
+   return buf->destroy_associated_data == zink_destroy_associated_data ?
+          buf->associated_data : NULL;
+}
+
+/* Whether a DPB slot holds the picture surf. */
+static bool
+in_dpb(const struct zink_video_codec *zvc,
+       const struct zink_video_surf_data *surf)
+{
+   for (unsigned i = 0; surf && i < ARRAY_SIZE(zvc->dpb_pics); i++) {
+      if (zvc->dpb_pics[i] == surf->serial)
+         return true;
+   }
+   return false;
+}
+
+/* Gives a free DPB slot to the picture surf. */
+static void
+take_dpb_slot(struct zink_video_codec *zvc, struct zink_video_surf_data *surf)
+{
+   unsigned slot = 0;
+   while (slot < zvc->max_dpb_slots - 1 && zvc->dpb_pics[slot])
+      slot++;
+   assert(!zvc->dpb_pics[slot]);
+   zvc->dpb_pics[slot] = surf->serial;
+   surf->dpb_index = slot;
+}
+
+/* Has the DPB slots hold the pictures of refs, which other codecs may have
+ * decoded, and target. The pictures keep their data.
+ */
+static struct zink_video_surf_data *
+assign_dpb_slots(struct zink_video_codec *zvc, struct pipe_video_buffer *target,
+                 struct pipe_video_buffer *const *refs, unsigned num_refs)
+{
+   for (unsigned i = 0; i < ARRAY_SIZE(zvc->dpb_pics); i++) {
+      bool held = false;
+      for (unsigned j = 0; j < num_refs; j++) {
+         const struct zink_video_surf_data *rsurf =
+            refs[j] ? picture_data(refs[j]) : NULL;
+         held |= rsurf && zvc->dpb_pics[i] == rsurf->serial;
+      }
+      if (!held)
+         zvc->dpb_pics[i] = 0;
+   }
+
+   /* Another codec's pictures are in no DPB slot of this one yet: with
+    * separate DPB images, their picture is in the other codec's.
+    */
+   if (zvc->coincide_dpb) {
+      for (unsigned j = 0; j < num_refs; j++) {
+         struct zink_video_surf_data *rsurf = refs[j] ? picture_data(refs[j]) : NULL;
+         if (rsurf && !in_dpb(zvc, rsurf))
+            take_dpb_slot(zvc, rsurf);
+      }
+   }
+
+   struct zink_video_surf_data *surf = picture_data(target);
+   if (!surf) {
+      surf = create_surf(zvc, target, 0);
+      vl_video_buffer_set_associated_data(target, &zvc->base, surf,
+                                          &zink_destroy_associated_data);
+   }
+   take_dpb_slot(zvc, surf);
+   return surf;
+}
+
+/* The picture resource of the DPB slot of the picture surf, of the size of
+ * the frame decoded to it.
+ */
+static VkVideoPictureResourceInfoKHR
+dpb_picture_resource(const struct zink_video_codec *zvc,
+                     const struct zink_video_surf_data *surf)
+{
+   VkVideoPictureResourceInfoKHR res = zvc->coincide_dpb ?
+      surf->resource : zvc->dpb_resources[surf->dpb_index];
+   res.codedExtent = surf->resource.codedExtent;
+   return res;
+}
+
+static int
+zink_end_frame_vp9(struct pipe_video_codec *codec,
+                   struct pipe_video_buffer *target,
+                   struct pipe_picture_desc *picture)
+{
+   struct zink_video_codec *zvc = (struct zink_video_codec *)codec;
+   struct zink_context *ctx = zink_context(codec->context);
+   struct zink_screen *screen = (struct zink_screen *)zvc->screen;
+   struct pipe_vp9_picture_desc *vp9 = (struct pipe_vp9_picture_desc *)picture;
+   const bool intra = vp9->picture_parameter.pic_fields.frame_type == 0 || vp9->picture_parameter.pic_fields.intra_only;
+
+   end_bitstream(zvc);
+
+   /* The pictures of the 8 reference frames stay in the DPB. */
+   struct zink_video_surf_data *surf =
+      assign_dpb_slots(zvc, target, vp9->ref, STD_VIDEO_VP9_NUM_REF_FRAMES);
+   surf->resource.codedExtent.width = vp9->picture_parameter.frame_width;
+   surf->resource.codedExtent.height = vp9->picture_parameter.frame_height;
+
+   /* The references of the frame, LAST, GOLDEN and ALTREF, which may be the
+    * same picture, and the setup slot for the frame.
+    */
+   const unsigned ref_frames[STD_VIDEO_VP9_REFS_PER_FRAME] = {
+      vp9->picture_parameter.pic_fields.last_ref_frame,
+      vp9->picture_parameter.pic_fields.golden_ref_frame,
+      vp9->picture_parameter.pic_fields.alt_ref_frame,
+   };
+   struct zink_video_surf_data *ref_surfs[STD_VIDEO_VP9_REFS_PER_FRAME];
+   VkVideoPictureResourceInfoKHR ref_res[STD_VIDEO_VP9_REFS_PER_FRAME + 1];
+   VkVideoReferenceSlotInfoKHR ref_info[STD_VIDEO_VP9_REFS_PER_FRAME + 1] = { 0 };
+   VkVideoDecodeVP9PictureInfoKHR vpi = { 0 };
+   vpi.sType = VK_STRUCTURE_TYPE_VIDEO_DECODE_VP9_PICTURE_INFO_KHR;
+   unsigned num_refs = 0;
+   for (unsigned i = 0; i < STD_VIDEO_VP9_REFS_PER_FRAME; i++) {
+      vpi.referenceNameSlotIndices[i] = -1;
+      ref_surfs[i] = NULL;
+      if (intra || !vp9->ref[ref_frames[i]])
+         continue;
+
+      struct zink_video_surf_data *rsurf = picture_data(vp9->ref[ref_frames[i]]);
+      if (!in_dpb(zvc, rsurf))
+         continue;
+      ref_surfs[i] = rsurf;
+      vpi.referenceNameSlotIndices[i] = rsurf->dpb_index;
+
+      bool listed = false;
+      for (unsigned j = 0; j < num_refs; j++)
+         listed |= ref_info[j].slotIndex == rsurf->dpb_index;
+      if (listed)
+         continue;
+
+      ref_res[num_refs] = dpb_picture_resource(zvc, rsurf);
+      ref_info[num_refs].sType = VK_STRUCTURE_TYPE_VIDEO_REFERENCE_SLOT_INFO_KHR;
+      ref_info[num_refs].slotIndex = rsurf->dpb_index;
+      ref_info[num_refs].pPictureResource = &ref_res[num_refs];
+      num_refs++;
+   }
+
+   ref_res[num_refs] = dpb_picture_resource(zvc, surf);
+   VkVideoReferenceSlotInfoKHR setup_info = { 0 };
+   setup_info.sType = VK_STRUCTURE_TYPE_VIDEO_REFERENCE_SLOT_INFO_KHR;
+   setup_info.slotIndex = surf->dpb_index;
+   setup_info.pPictureResource = &ref_res[num_refs];
+   /* this must be added to the list of 'bound resources' */
+   ref_info[num_refs] = setup_info;
+   ref_info[num_refs].slotIndex = -1;
+
+   VkCommandBuffer cmdbuf = ctx->bs->cmdbuf;
+
+   if (zvc->coincide_dpb) {
+      for (unsigned i = 0; i < STD_VIDEO_VP9_REFS_PER_FRAME; i++) {
+         if (ref_surfs[i])
+            video_image_barrier(ctx, cmdbuf, video_buffer_resource(vp9->ref[ref_frames[i]]),
+                                VK_IMAGE_LAYOUT_VIDEO_DECODE_DPB_KHR);
+      }
+      video_image_barrier(ctx, cmdbuf, video_buffer_resource(target), VK_IMAGE_LAYOUT_VIDEO_DECODE_DPB_KHR);
+   } else {
+      if (zvc->dpb_array) {
+         video_image_barrier(ctx, cmdbuf, zink_resource(zvc->dpb_res[0]), VK_IMAGE_LAYOUT_VIDEO_DECODE_DPB_KHR);
+      } else {
+         for (unsigned i = 0; i < STD_VIDEO_VP9_REFS_PER_FRAME; i++) {
+            if (ref_surfs[i])
+               video_image_barrier(ctx, cmdbuf, zink_resource(zvc->dpb_res[ref_surfs[i]->dpb_index]),
+                                   VK_IMAGE_LAYOUT_VIDEO_DECODE_DPB_KHR);
+         }
+         video_image_barrier(ctx, cmdbuf, zink_resource(zvc->dpb_res[surf->dpb_index]), VK_IMAGE_LAYOUT_VIDEO_DECODE_DPB_KHR);
+      }
+      video_image_barrier(ctx, cmdbuf, video_buffer_resource(target), VK_IMAGE_LAYOUT_VIDEO_DECODE_DST_KHR);
+   }
+
+   VkVideoBeginCodingInfoKHR bci = { 0 };
+   bci.sType = VK_STRUCTURE_TYPE_VIDEO_BEGIN_CODING_INFO_KHR;
+   bci.videoSession = zvc->session;
+   bci.referenceSlotCount = num_refs + 1;
+   bci.pReferenceSlots = ref_info;
+
+   VKSCR(CmdBeginVideoCodingKHR)(cmdbuf, &bci);
+
+   if (!zvc->reset_sent) {
+      VkVideoCodingControlInfoKHR cc = {0};
+      cc.sType = VK_STRUCTURE_TYPE_VIDEO_CODING_CONTROL_INFO_KHR;
+      cc.flags = VK_VIDEO_CODING_CONTROL_RESET_BIT_KHR;
+      VKSCR(CmdControlVideoCodingKHR)(cmdbuf, &cc);
+      zvc->reset_sent = true;
+   }
+
+   struct zink_resource *zbs = zvc->bitstream_res;
+   VkBufferMemoryBarrier2KHR bitstream_bmb;
+   bitstream_bmb.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2_KHR;
+   bitstream_bmb.pNext = NULL;
+   bitstream_bmb.srcStageMask = VK_PIPELINE_STAGE_2_HOST_BIT_KHR;
+   bitstream_bmb.srcAccessMask = VK_ACCESS_2_HOST_WRITE_BIT_KHR;
+   bitstream_bmb.dstStageMask = VK_PIPELINE_STAGE_2_VIDEO_DECODE_BIT_KHR;
+   bitstream_bmb.dstAccessMask = VK_ACCESS_2_VIDEO_DECODE_READ_BIT_KHR;
+   bitstream_bmb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+   bitstream_bmb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+   bitstream_bmb.buffer = zbs->obj->buffer;
+   bitstream_bmb.size = align64(zvc->bs_size, zvc->srcbuf_align);
+   bitstream_bmb.offset = 0;
+
+   VkDependencyInfoKHR di = { 0 };
+   di.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR;
+   di.dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT;
+   di.bufferMemoryBarrierCount = 1;
+   di.pBufferMemoryBarriers = &bitstream_bmb;
+   VKSCR(CmdPipelineBarrier2KHR)(cmdbuf, &di);
+
+   StdVideoVP9ColorConfig color = { 0 };
+   color.flags.color_range = vp9->picture_parameter.color_range;
+   color.BitDepth = vp9->picture_parameter.bit_depth ? vp9->picture_parameter.bit_depth : 8;
+   color.subsampling_x = vp9->picture_parameter.pic_fields.subsampling_x;
+   color.subsampling_y = vp9->picture_parameter.pic_fields.subsampling_y;
+   color.color_space = vp9->picture_parameter.color_space;
+
+   StdVideoVP9LoopFilter lf = { 0 };
+   lf.flags.loop_filter_delta_enabled = vp9->picture_parameter.mode_ref_delta_enabled;
+   lf.flags.loop_filter_delta_update = vp9->picture_parameter.mode_ref_delta_update;
+   lf.loop_filter_level = vp9->picture_parameter.filter_level;
+   lf.loop_filter_sharpness = vp9->picture_parameter.sharpness_level;
+   lf.update_ref_delta = vp9->picture_parameter.update_ref_delta;
+   lf.update_mode_delta = vp9->picture_parameter.update_mode_delta;
+   memcpy(lf.loop_filter_ref_deltas, vp9->picture_parameter.ref_deltas, sizeof(lf.loop_filter_ref_deltas));
+   memcpy(lf.loop_filter_mode_deltas, vp9->picture_parameter.mode_deltas, sizeof(lf.loop_filter_mode_deltas));
+
+   StdVideoVP9Segmentation seg = { 0 };
+   seg.flags.segmentation_update_map = vp9->picture_parameter.pic_fields.segmentation_update_map;
+   seg.flags.segmentation_temporal_update = vp9->picture_parameter.pic_fields.segmentation_temporal_update;
+   seg.flags.segmentation_update_data = vp9->picture_parameter.pic_fields.segmentation_update_data;
+   seg.flags.segmentation_abs_or_delta_update = vp9->picture_parameter.abs_delta;
+   memcpy(seg.segmentation_tree_probs, vp9->picture_parameter.mb_segment_tree_probs, sizeof(seg.segmentation_tree_probs));
+   memcpy(seg.segmentation_pred_prob, vp9->picture_parameter.segment_pred_probs, sizeof(seg.segmentation_pred_prob));
+   for (unsigned i = 0; i < STD_VIDEO_VP9_MAX_SEGMENTS; i++) {
+      const struct vp9_segment_parameter *sp = &vp9->slice_parameter.seg_param[i];
+      seg.FeatureEnabled[i] =
+         sp->alt_quant_enabled << VP9_SEG_LVL_ALT_Q |
+         sp->alt_lf_enabled << VP9_SEG_LVL_ALT_L |
+         sp->segment_flags.segment_reference_enabled << VP9_SEG_LVL_REF_FRAME |
+         sp->segment_flags.segment_reference_skipped << VP9_SEG_LVL_SKIP;
+      seg.FeatureData[i][VP9_SEG_LVL_ALT_Q] = sp->alt_quant;
+      seg.FeatureData[i][VP9_SEG_LVL_ALT_L] = sp->alt_lf;
+      seg.FeatureData[i][VP9_SEG_LVL_REF_FRAME] = sp->segment_flags.segment_reference;
+   }
+
+   StdVideoDecodeVP9PictureInfo pi = { 0 };
+   pi.flags.error_resilient_mode = vp9->picture_parameter.pic_fields.error_resilient_mode;
+   pi.flags.intra_only = vp9->picture_parameter.pic_fields.intra_only;
+   pi.flags.allow_high_precision_mv = vp9->picture_parameter.pic_fields.allow_high_precision_mv;
+   pi.flags.refresh_frame_context = vp9->picture_parameter.pic_fields.refresh_frame_context;
+   pi.flags.frame_parallel_decoding_mode = vp9->picture_parameter.pic_fields.frame_parallel_decoding_mode;
+   pi.flags.segmentation_enabled = vp9->picture_parameter.pic_fields.segmentation_enabled;
+   pi.flags.show_frame = vp9->picture_parameter.pic_fields.show_frame;
+   pi.flags.UsePrevFrameMvs = vp9->picture_parameter.pic_fields.use_prev_frame_mvs;
+   pi.profile = (StdVideoVP9Profile)vp9->picture_parameter.profile;
+   pi.frame_type = vp9->picture_parameter.pic_fields.frame_type ? STD_VIDEO_VP9_FRAME_TYPE_NON_KEY :
+                                               STD_VIDEO_VP9_FRAME_TYPE_KEY;
+   pi.frame_context_idx = vp9->picture_parameter.pic_fields.frame_context_idx;
+   pi.reset_frame_context = vp9->picture_parameter.pic_fields.reset_frame_context;
+   pi.refresh_frame_flags = vp9->picture_parameter.refresh_frame_flags;
+   pi.ref_frame_sign_bias_mask =
+      vp9->picture_parameter.pic_fields.last_ref_frame_sign_bias << STD_VIDEO_VP9_REFERENCE_NAME_LAST_FRAME |
+      vp9->picture_parameter.pic_fields.golden_ref_frame_sign_bias << STD_VIDEO_VP9_REFERENCE_NAME_GOLDEN_FRAME |
+      vp9->picture_parameter.pic_fields.alt_ref_frame_sign_bias << STD_VIDEO_VP9_REFERENCE_NAME_ALTREF_FRAME;
+   pi.interpolation_filter = (StdVideoVP9InterpolationFilter)vp9->picture_parameter.pic_fields.mcomp_filter_type;
+   pi.base_q_idx = vp9->picture_parameter.base_qindex;
+   pi.delta_q_y_dc = vp9->picture_parameter.y_dc_delta_q;
+   pi.delta_q_uv_dc = vp9->picture_parameter.uv_dc_delta_q;
+   pi.delta_q_uv_ac = vp9->picture_parameter.uv_ac_delta_q;
+   pi.tile_cols_log2 = vp9->picture_parameter.log2_tile_columns;
+   pi.tile_rows_log2 = vp9->picture_parameter.log2_tile_rows;
+   pi.pColorConfig = &color;
+   pi.pLoopFilter = &lf;
+   pi.pSegmentation = vp9->picture_parameter.pic_fields.segmentation_enabled ? &seg : NULL;
+
+   vpi.pStdPictureInfo = &pi;
+   /* The frame is in the bitstream buffer whole: its uncompressed header,
+    * compressed header and tiles.
+    */
+   vpi.uncompressedHeaderOffset = 0;
+   vpi.compressedHeaderOffset = vp9->picture_parameter.frame_header_length_in_bytes;
+   vpi.tilesOffset = vp9->picture_parameter.frame_header_length_in_bytes + vp9->picture_parameter.first_partition_size;
+
+   VkVideoDecodeInfoKHR vdi = { 0 };
+   vdi.sType = VK_STRUCTURE_TYPE_VIDEO_DECODE_INFO_KHR;
+   vdi.pNext = &vpi;
+   vdi.referenceSlotCount = num_refs;
+   vdi.pReferenceSlots = ref_info;
+   vdi.pSetupReferenceSlot = &setup_info;
+   vdi.dstPictureResource = surf->resource;
+   vdi.srcBuffer = zbs->obj->buffer;
+   vdi.srcBufferOffset = 0;
+   vdi.srcBufferRange = align64(zvc->bs_size, zvc->srcbuf_align);
+   VKSCR(CmdDecodeVideoKHR)(cmdbuf, &vdi);
+
+   end_coding(ctx, zvc, cmdbuf);
+
+   return 0;
+}
+
 static void
 zink_video_flush(struct pipe_video_codec *codec) {
 }
@@ -772,7 +1099,9 @@ zink_create_video_codec(struct pipe_context *pctx, const struct pipe_video_codec
    zvc->base.begin_frame = zink_begin_frame;
    zvc->base.decode_macroblock = zink_decode_macroblock;
    zvc->base.decode_bitstream = zink_decode_bitstream;
-   zvc->base.end_frame = zink_end_frame_h264;
+   zvc->base.end_frame =
+      u_reduce_video_profile(templat->profile) == PIPE_VIDEO_FORMAT_VP9 ?
+      zink_end_frame_vp9 : zink_end_frame_h264;
    zvc->base.flush = zink_video_flush;
    zvc->base.context = pctx;
 
@@ -850,6 +1179,8 @@ convert_decode_op(enum pipe_video_format vid_format)
    switch (vid_format) {
    case PIPE_VIDEO_FORMAT_MPEG4_AVC:
       return VK_VIDEO_CODEC_OPERATION_DECODE_H264_BIT_KHR;
+   case PIPE_VIDEO_FORMAT_VP9:
+      return VK_VIDEO_CODEC_OPERATION_DECODE_VP9_BIT_KHR;
    default:
       assert(0);
       return VK_VIDEO_CODEC_OPERATION_NONE_KHR;
@@ -877,6 +1208,9 @@ zink_video_fill_single_profile(struct zink_screen *screen,
    if (vid_format == PIPE_VIDEO_FORMAT_MPEG4_AVC &&
        !screen->info.have_KHR_video_decode_h264)
       return false;
+   if (vid_format == PIPE_VIDEO_FORMAT_VP9 &&
+       !screen->info.have_KHR_video_decode_vp9)
+      return false;
 
    out_prof->profile.sType = VK_STRUCTURE_TYPE_VIDEO_PROFILE_INFO_KHR;
 
@@ -891,6 +1225,12 @@ zink_video_fill_single_profile(struct zink_screen *screen,
       out_prof->h264.stdProfileIdc = h264_profile_conv(profile);
       out_prof->h264.pictureLayout = VK_VIDEO_DECODE_H264_PICTURE_LAYOUT_PROGRESSIVE_KHR;
       out_prof->profile.pNext = &out_prof->h264;
+      break;
+   case PIPE_VIDEO_FORMAT_VP9:
+      out_prof->vp9.sType = VK_STRUCTURE_TYPE_VIDEO_DECODE_VP9_PROFILE_INFO_KHR;
+      out_prof->vp9.stdProfile = profile == PIPE_VIDEO_PROFILE_VP9_PROFILE2 ?
+         STD_VIDEO_VP9_PROFILE_2 : STD_VIDEO_VP9_PROFILE_0;
+      out_prof->profile.pNext = &out_prof->vp9;
       break;
    default:
       return false;
@@ -913,6 +1253,18 @@ zink_video_fill_profiles(struct zink_screen *screen,
          profile = PIPE_VIDEO_PROFILE_MPEG4_AVC_HIGH;
       if (zink_video_fill_single_profile(screen, profile, luma_depth, &profiles->h264)) {
          profiles->profiles[profile_count] = profiles->h264.profile;
+         profile_count++;
+      }
+   }
+
+   if (screen->info.have_KHR_video_decode_vp9 && (vid_format == PIPE_VIDEO_FORMAT_VP9 ||
+                                                  vid_format == PIPE_VIDEO_FORMAT_UNKNOWN)) {
+      enum pipe_video_profile vp9_profile = profile;
+      if (vid_format == PIPE_VIDEO_FORMAT_UNKNOWN)
+         vp9_profile = luma_depth > 8 ? PIPE_VIDEO_PROFILE_VP9_PROFILE2 :
+                                        PIPE_VIDEO_PROFILE_VP9_PROFILE0;
+      if (zink_video_fill_single_profile(screen, vp9_profile, luma_depth, &profiles->vp9)) {
+         profiles->profiles[profile_count] = profiles->vp9.profile;
          profile_count++;
       }
    }
@@ -944,8 +1296,16 @@ zink_video_fill_caps(struct zink_screen *screen,
    caps_info->caps.pNext = &caps_info->dec_caps;
    caps_info->dec_caps.sType = VK_STRUCTURE_TYPE_VIDEO_DECODE_CAPABILITIES_KHR;
 
-   caps_info->dec_caps.pNext = &caps_info->h264_dec_caps;
-   caps_info->h264_dec_caps.sType = VK_STRUCTURE_TYPE_VIDEO_DECODE_H264_CAPABILITIES_KHR;
+   switch (u_reduce_video_profile(profile)) {
+   case PIPE_VIDEO_FORMAT_VP9:
+      caps_info->dec_caps.pNext = &caps_info->vp9_dec_caps;
+      caps_info->vp9_dec_caps.sType = VK_STRUCTURE_TYPE_VIDEO_DECODE_VP9_CAPABILITIES_KHR;
+      break;
+   default:
+      caps_info->dec_caps.pNext = &caps_info->h264_dec_caps;
+      caps_info->h264_dec_caps.sType = VK_STRUCTURE_TYPE_VIDEO_DECODE_H264_CAPABILITIES_KHR;
+      break;
+   }
 
    return VKSCR(GetPhysicalDeviceVideoCapabilitiesKHR)(screen->pdev, &vk_profile.profile, &caps_info->caps) == VK_SUCCESS;
 }

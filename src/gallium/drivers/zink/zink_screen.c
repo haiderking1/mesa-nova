@@ -3028,6 +3028,8 @@ zink_get_video_param(struct pipe_screen *screen,
    case PIPE_VIDEO_PROFILE_MPEG4_AVC_HIGH:
    case PIPE_VIDEO_PROFILE_MPEG4_AVC_BASELINE:
    case PIPE_VIDEO_PROFILE_MPEG4_AVC_CONSTRAINED_BASELINE:
+   case PIPE_VIDEO_PROFILE_VP9_PROFILE0:
+   case PIPE_VIDEO_PROFILE_VP9_PROFILE2:
       is_supported = true;
       break;
    default:
@@ -3044,7 +3046,8 @@ zink_get_video_param(struct pipe_screen *screen,
    if (!is_supported)
       return 0;
 
-   if (!zink_video_fill_caps(zink_screen(screen), profile, entrypoint, false, &caps_info))
+   const bool bit_depth_10 = profile == PIPE_VIDEO_PROFILE_VP9_PROFILE2;
+   if (!zink_video_fill_caps(zink_screen(screen), profile, entrypoint, bit_depth_10, &caps_info))
       return 0;
    switch (param) {
    case PIPE_VIDEO_CAP_SUPPORTED:
