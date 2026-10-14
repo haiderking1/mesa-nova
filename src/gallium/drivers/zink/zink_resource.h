@@ -202,11 +202,14 @@ zink_batch_resource_usage_set(struct zink_batch_state *bs, struct zink_resource 
             util_dynarray_append(&bs->acquires, acquire);
       } else if (res->obj->exportable) {
          struct pipe_resource *pres = NULL;
-         bool found = false;
          simple_mtx_lock(&bs->exportable_lock);
-         _mesa_set_search_or_add(&bs->exports, res, &found);
+         struct hash_entry *he = _mesa_hash_table_search(&bs->exports, res);
+         bool found = he != NULL;
+         if (!found)
+            he = _mesa_hash_table_insert(&bs->exports, res, NULL);
+         /* the data of the entry is whether the batch wrote the image */
          if (write)
-            _mesa_set_add(&bs->dmabuf_writes, res);
+            he->data = (void *)(uintptr_t)true;
          simple_mtx_unlock(&bs->exportable_lock);
          if (!found) {
             pipe_resource_reference(&pres, &res->base.b);

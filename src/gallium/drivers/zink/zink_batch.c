@@ -367,8 +367,7 @@ create_batch_state(struct zink_context *ctx)
 
    SET_CREATE(&bs->programs);
    SET_CREATE(&bs->active_queries);
-   SET_CREATE(&bs->exports);
-   SET_CREATE(&bs->dmabuf_writes);
+   _mesa_hash_table_init(&bs->exports, bs, _mesa_hash_pointer, _mesa_key_pointer_equal);
    bs->signal_semaphores = UTIL_DYNARRAY_INIT;
    bs->user_signal_semaphores = UTIL_DYNARRAY_INIT;
    bs->user_signal_semaphore_values = UTIL_DYNARRAY_INIT;
@@ -861,7 +860,7 @@ submit_queue(void *data, void *gdata, int thread_index)
 
    unsigned i = 0;
    VkSemaphore *sem = bs->signal_semaphores.data;
-   set_foreach(&bs->exports, entry) {
+   hash_table_foreach(&bs->exports, entry) {
       struct zink_resource *res = (void*)entry->key;
       /* The semaphores of a failed submission have no signal operation
        * pending, which exporting them as sync files would wait for forever.
@@ -870,7 +869,7 @@ submit_queue(void *data, void *gdata, int thread_index)
        * otherwise as a read fence, which only later writers wait for.
        */
       if (res->obj->exportable_dmabuf && !bs->is_device_lost) {
-         bool write = _mesa_set_search(&bs->dmabuf_writes, res) != NULL;
+         bool write = entry->data != NULL;
          for (struct zink_resource *r = res; r; r = zink_resource(r->base.b.next)) {
             if (!zink_resource_plane_owns_dmabuf(res, r))
                continue;
@@ -881,8 +880,7 @@ submit_queue(void *data, void *gdata, int thread_index)
       struct pipe_resource *pres = (void*)entry->key;
       pipe_resource_reference(&pres, NULL);
    }
-   _mesa_set_clear(&bs->exports, NULL);
-   _mesa_set_clear(&bs->dmabuf_writes, NULL);
+   _mesa_hash_table_clear(&bs->exports, NULL);
 
    if (bs->sparse_semaphore)
       (void)util_dynarray_pop(&bs->acquires, VkSemaphore);
@@ -960,11 +958,11 @@ zink_end_batch(struct zink_context *ctx)
     * for the write fences if the batch just read the image, but for all of
     * them if the batch wrote it.
     */
-   set_foreach(&bs->exports, entry) {
+   hash_table_foreach(&bs->exports, entry) {
       struct zink_resource *res = (void*)entry->key;
       if (!res->obj->exportable_dmabuf)
          continue;
-      bool write = _mesa_set_search(&bs->dmabuf_writes, res) != NULL;
+      bool write = entry->data != NULL;
       for (struct zink_resource *r = res; r; r = zink_resource(r->base.b.next)) {
          if (!zink_resource_plane_owns_dmabuf(res, r))
             continue;
@@ -974,7 +972,7 @@ zink_end_batch(struct zink_context *ctx)
       }
    }
 
-   set_foreach(&bs->exports, entry) {
+   hash_table_foreach(&bs->exports, entry) {
       struct zink_resource *res = (void*)entry->key;
       if (screen->info.have_KHR_synchronization2) {
          VkImageMemoryBarrier2 imb;
