@@ -535,6 +535,11 @@ can_disjoint(struct zink_screen *screen, const struct pipe_resource *templ, unsi
 {
    if (!(feats & VK_FORMAT_FEATURE_DISJOINT_BIT) || util_format_get_num_planes(templ->format) <= 1)
       return false;
+   /* a dma-buf has every plane in one memory object, at the offsets of the
+    * plane layouts, which are relative to each plane's memory if disjoint
+    */
+   if (bind & ZINK_BIND_DMABUF)
+      return false;
    if (!(bind & ZINK_BIND_VIDEO))
       return true;
 
@@ -1697,12 +1702,11 @@ bind_image_memory(struct zink_screen *screen, struct zink_resource_object *obj,
          infos[i].memory = zink_bo_get_mem(obj->bo);
          infos[i].memoryOffset = obj->plane_offsets[i];
          assert(!alloc_info->need_dedicated || obj->plane_offsets[i] == 0);
-         if (templ->bind & ZINK_BIND_VIDEO) {
-            infos[i].pNext = &planes[i];
-            planes[i].sType = VK_STRUCTURE_TYPE_BIND_IMAGE_PLANE_MEMORY_INFO;
-            planes[i].pNext = NULL;
-            planes[i].planeAspect = plane_aspects[i];
-         }
+         /* each plane of a disjoint image is bound on its own */
+         infos[i].pNext = &planes[i];
+         planes[i].sType = VK_STRUCTURE_TYPE_BIND_IMAGE_PLANE_MEMORY_INFO;
+         planes[i].pNext = NULL;
+         planes[i].planeAspect = plane_aspects[i];
       }
       if (VKSCR(BindImageMemory2)(screen->dev, num_planes, infos) != VK_SUCCESS) {
          mesa_loge("ZINK: vkBindImageMemory2 failed");
@@ -1838,7 +1842,7 @@ create_image(struct zink_screen *screen, struct zink_resource_object *obj,
 
    if (!(templ->bind & ZINK_BIND_VIDEO)) {
       obj->vkfeats = get_format_feature_flags(ici, screen, templ);
-      if (obj->vkfeats & VK_FORMAT_FEATURE_DISJOINT_BIT)
+      if (can_disjoint(screen, templ, templ->bind, obj->vkfeats))
          ici.flags |= VK_IMAGE_CREATE_DISJOINT_BIT;
    }
    if (util_format_is_yuv(templ->format)) {
