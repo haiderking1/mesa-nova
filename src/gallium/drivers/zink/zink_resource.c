@@ -1920,10 +1920,13 @@ resource_object_create(struct zink_screen *screen, const struct pipe_resource *t
       .user_mem = user_mem
    };
 
-   /* figure out aux plane count: the memory planes after the first, which the
-    * planes of a multi-planar format imported one by one are too
+   /* figure out aux plane count: the memory planes beyond the format's, and the
+    * planes after the first of a multi-planar format imported one by one (not
+    * those imported as images of their own format)
     */
-   if (whandle && whandle->plane > 0)
+   if (whandle &&
+       (whandle->plane >= util_format_get_num_planes(whandle->format) ||
+        (whandle->plane > 0 && templ->format == whandle->format)))
       obj->is_aux = true;
    struct pipe_resource *pnext = templ->next;
    for (obj->plane_count = 1; pnext; obj->plane_count++, pnext = pnext->next) {
