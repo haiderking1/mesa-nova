@@ -202,7 +202,8 @@ zink_video_create_session(struct zink_video_codec *zvc,
    zink_video_fill_caps(screen, profile,
                         entrypoint, bit_depth != 8, &caps_info);
 
-   zvc->max_dpb_slots = caps_info.caps.maxDpbSlots;
+   /* the DPB arrays have room for 17 slots, what H.264 and H.265 can use */
+   zvc->max_dpb_slots = MIN2(caps_info.caps.maxDpbSlots, ARRAY_SIZE(zvc->dpb_res));
    zvc->coincide_dpb = caps_info.dec_caps.flags & VK_VIDEO_DECODE_CAPABILITY_DPB_AND_OUTPUT_COINCIDE_BIT_KHR;
    zvc->dpb_array = !(caps_info.caps.flags & VK_VIDEO_CAPABILITY_SEPARATE_REFERENCE_IMAGES_BIT_KHR);
    zvc->dpb_format = format;
@@ -250,7 +251,7 @@ zink_video_create_session(struct zink_video_codec *zvc,
    sci.pictureFormat = zink_get_format(screen, format);
    sci.referencePictureFormat = zink_get_format(screen, format);
    sci.maxActiveReferencePictures = caps_info.caps.maxActiveReferencePictures;
-   sci.maxDpbSlots = caps_info.caps.maxDpbSlots;
+   sci.maxDpbSlots = zvc->max_dpb_slots;
    switch (vid_format) {
    case PIPE_VIDEO_FORMAT_HEVC:
       sci.pStdHeaderVersion = &h265_props;
@@ -864,16 +865,23 @@ in_dpb(const struct zink_video_codec *zvc,
    return false;
 }
 
-/* Gives a free DPB slot to the picture surf. */
-static void
+/* Gives a free DPB slot to the picture surf. Fails if every slot holds a
+ * picture that is still referenced: valid streams never need more slots
+ * than the codec allows, but a broken stream or a decoder with fewer slots
+ * than that can.
+ */
+static bool
 take_dpb_slot(struct zink_video_codec *zvc, struct zink_video_surf_data *surf)
 {
-   unsigned slot = 0;
-   while (slot < zvc->max_dpb_slots - 1 && zvc->dpb_pics[slot])
-      slot++;
-   assert(!zvc->dpb_pics[slot]);
-   zvc->dpb_pics[slot] = surf->serial;
-   surf->dpb_index = slot;
+   for (unsigned slot = 0; slot < zvc->max_dpb_slots; slot++) {
+      if (!zvc->dpb_pics[slot]) {
+         zvc->dpb_pics[slot] = surf->serial;
+         surf->dpb_index = slot;
+         return true;
+      }
+   }
+   mesa_loge("zink: no free DPB slot, the picture isn't decoded");
+   return false;
 }
 
 /* Has the DPB slots hold the pictures of refs, which other codecs may have
@@ -900,14 +908,13 @@ assign_dpb_slots(struct zink_video_codec *zvc, struct pipe_video_buffer *target,
    if (zvc->coincide_dpb) {
       for (unsigned j = 0; j < num_refs; j++) {
          struct zink_video_surf_data *rsurf = refs[j] ? picture_data(refs[j]) : NULL;
-         if (rsurf && !in_dpb(zvc, rsurf))
-            take_dpb_slot(zvc, rsurf);
+         if (rsurf && !in_dpb(zvc, rsurf) && !take_dpb_slot(zvc, rsurf))
+            return NULL;
       }
    }
 
    struct zink_video_surf_data *surf = video_buffer_surf(zvc, target);
-   take_dpb_slot(zvc, surf);
-   return surf;
+   return take_dpb_slot(zvc, surf) ? surf : NULL;
 }
 
 /* The picture resource of the DPB slot of the picture surf, of the size of
@@ -934,11 +941,16 @@ zink_end_frame_vp9(struct pipe_video_codec *codec,
    struct pipe_vp9_picture_desc *vp9 = (struct pipe_vp9_picture_desc *)picture;
    const bool intra = vp9->picture_parameter.pic_fields.frame_type == 0 || vp9->picture_parameter.pic_fields.intra_only;
 
-   upload_bitstream(ctx, zvc);
-
-   /* The pictures of the 8 reference frames stay in the DPB. */
+   /* The pictures of the 8 reference frames stay in the DPB. The slots are
+    * taken before anything is recorded, so a frame that can't get one fails
+    * with nothing to undo.
+    */
    struct zink_video_surf_data *surf =
       assign_dpb_slots(zvc, target, vp9->ref, STD_VIDEO_VP9_NUM_REF_FRAMES);
+   if (!surf)
+      return -1;
+
+   upload_bitstream(ctx, zvc);
    surf->resource.codedExtent.width = vp9->picture_parameter.frame_width;
    surf->resource.codedExtent.height = vp9->picture_parameter.frame_height;
    fit_dpb_image(zvc, surf);
@@ -1189,13 +1201,16 @@ zink_end_frame_h265(struct pipe_video_codec *codec,
    struct pipe_h265_pps *ppps = h265->pps;
    struct pipe_h265_sps *psps = ppps->sps;
 
-   upload_bitstream(ctx, zvc);
-
    /* The pictures of the DPB, the references of the picture and of those
-    * after it, stay in the DPB.
+    * after it, stay in the DPB. The slots are taken before anything is
+    * recorded, so a frame that can't get one fails with nothing to undo.
     */
    struct zink_video_surf_data *surf =
       assign_dpb_slots(zvc, target, h265->ref, ARRAY_SIZE(h265->ref));
+   if (!surf)
+      return -1;
+
+   upload_bitstream(ctx, zvc);
    surf->resource.codedExtent.width = psps->pic_width_in_luma_samples;
    surf->resource.codedExtent.height = psps->pic_height_in_luma_samples;
 
@@ -1689,11 +1704,16 @@ zink_end_frame_av1(struct pipe_video_codec *codec,
                       frame_type == STD_VIDEO_AV1_FRAME_TYPE_INTRA_ONLY;
    const unsigned sb_mi_log2 = av1->picture_parameter.seq_info_fields.use_128x128_superblock ? 5 : 4;
 
-   upload_bitstream(ctx, zvc);
-
-   /* The pictures of the 8 reference frames stay in the DPB. */
+   /* The pictures of the 8 reference frames stay in the DPB. The slots are
+    * taken before anything is recorded, so a frame that can't get one fails
+    * with nothing to undo.
+    */
    struct zink_video_surf_data *surf =
       assign_dpb_slots(zvc, target, av1->ref, STD_VIDEO_AV1_NUM_REF_FRAMES);
+   if (!surf)
+      return -1;
+
+   upload_bitstream(ctx, zvc);
    surf->resource.codedExtent.width = av1->picture_parameter.frame_width;
    surf->resource.codedExtent.height = av1->picture_parameter.frame_height;
 
