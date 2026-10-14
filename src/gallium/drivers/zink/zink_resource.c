@@ -704,6 +704,25 @@ try_usage_mutable(struct zink_screen *screen, VkImageCreateInfo *ici, VkImageUsa
    return check_ici(screen, ici, mod);
 }
 
+/* The usage of an image with a DRM format modifier. Sampler-only images get
+ * color attachment usage for u_blitter, through EXTENDED_USAGE if their format
+ * doesn't have it, which needs MUTABLE_FORMAT and so a format list with a
+ * modifier. Multi-planar images can't be color attachments as a whole anyway,
+ * so they are only sampled and copied.
+ */
+static VkImageUsageFlags
+get_modifier_image_usage(struct zink_screen *screen, VkFormatFeatureFlags2 feats,
+                         const struct pipe_resource *templ, unsigned bind)
+{
+   bool need_extended = false;
+   VkImageUsageFlags usage = get_image_usage_for_feats(screen, feats, templ, bind, &need_extended);
+   if (need_extended && util_format_get_num_planes(templ->format) > 1)
+      usage = get_image_usage_for_feats(screen, feats, templ, bind & ~PIPE_BIND_SAMPLER_VIEW,
+                                        &need_extended);
+   assert(!need_extended);
+   return usage;
+}
+
 static bool
 find_good_mod(struct zink_screen *screen, VkImageCreateInfo *ici, const struct pipe_resource *templ, unsigned bind, unsigned modifiers_count, uint64_t *modifiers, uint64_t *out_mod, VkImageUsageFlags *out_usage, VkImageCreateFlags *out_flags)
 {
@@ -741,8 +760,7 @@ find_good_mod(struct zink_screen *screen, VkImageCreateInfo *ici, const struct p
          }
       }
 
-      VkImageUsageFlags usage = get_image_usage_for_feats(screen, feats, templ, bind, &need_extended);
-      assert(!need_extended);
+      VkImageUsageFlags usage = get_modifier_image_usage(screen, feats, templ, bind);
       if (try_usage_mutable(screen, ici, usage, modifiers[i])) {
          found = true;
          *out_mod = modifiers[i];
@@ -808,12 +826,10 @@ negotiate_image_config(struct zink_screen *screen, VkImageCreateInfo *ici, const
       const struct zink_modifier_props *prop = zink_get_modifier_props(screen, templ->format);
       VkFormatFeatureFlags feats = find_modifier_feats(prop, DRM_FORMAT_MOD_LINEAR);
       if (feats) {
-         bool need_extended = false;
          VkImageCreateFlags saved_flags = ici->flags;
          if (can_disjoint(screen, templ, bind, feats))
             ici->flags |= VK_IMAGE_CREATE_DISJOINT_BIT;
-         VkImageUsageFlags usage = get_image_usage_for_feats(screen, feats, templ, bind, &need_extended);
-         assert(!need_extended);
+         VkImageUsageFlags usage = get_modifier_image_usage(screen, feats, templ, bind);
          if (try_usage_mutable(screen, ici, usage, DRM_FORMAT_MOD_LINEAR)) {
             mod = DRM_FORMAT_MOD_LINEAR;
             goto found;
