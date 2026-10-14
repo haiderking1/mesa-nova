@@ -235,7 +235,7 @@ zink_video_create_session(struct zink_video_codec *zvc,
          for (unsigned j = 0; !zvc->priv_mems[i] && j < screen->heap_count[heap]; j++) {
             if (!(session_memory_reqs[i].memoryRequirements.memoryTypeBits & BITFIELD_BIT(screen->heap_map[heap][j])))
                continue;
-            zvc->priv_mems[i] = zink_bo(zink_bo_create(screen, session_memory_reqs[i].memoryRequirements.size, session_memory_reqs[i].memoryRequirements.alignment, heap, ZINK_ALLOC_NO_SUBALLOC, screen->heap_map[heap][j], NULL));
+            zvc->priv_mems[i] = zink_bo(zink_bo_create(screen, session_memory_reqs[i].memoryRequirements.size, session_memory_reqs[i].memoryRequirements.alignment, heap, ZINK_ALLOC_NO_SUBALLOC, screen->heap_map[heap][j], NULL, NULL));
          }
       }
       VkDeviceMemory mem = zink_bo_get_mem(zvc->priv_mems[i]);
