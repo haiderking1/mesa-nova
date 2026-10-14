@@ -75,17 +75,23 @@ struct zink_video_surf_data {
    /* Unique to the picture, never 0 */
    uint64_t serial;
    uint32_t dpb_index;
+   /* What decoding AV1 frames referencing the frame decoded to the picture
+    * needs of it.
+    */
+   StdVideoDecodeAV1ReferenceInfo av1;
 };
 
 struct zink_video_profile {
    VkVideoDecodeH264ProfileInfoKHR h264;
    VkVideoDecodeVP9ProfileInfoKHR vp9;
+   VkVideoDecodeAV1ProfileInfoKHR av1;
    VkVideoProfileInfoKHR profile;
 };
 
 struct zink_video_profile_info {
    struct zink_video_profile h264;
    struct zink_video_profile vp9;
+   struct zink_video_profile av1;
    VkVideoProfileInfoKHR profiles[4];
    VkVideoProfileListInfoKHR list;
 };
@@ -100,6 +106,7 @@ struct zink_video_caps_info {
    VkVideoDecodeCapabilitiesKHR dec_caps;
    VkVideoDecodeH264CapabilitiesKHR h264_dec_caps;
    VkVideoDecodeVP9CapabilitiesKHR vp9_dec_caps;
+   VkVideoDecodeAV1CapabilitiesKHR av1_dec_caps;
 };
 
 bool

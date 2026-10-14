@@ -3030,6 +3030,7 @@ zink_get_video_param(struct pipe_screen *screen,
    case PIPE_VIDEO_PROFILE_MPEG4_AVC_CONSTRAINED_BASELINE:
    case PIPE_VIDEO_PROFILE_VP9_PROFILE0:
    case PIPE_VIDEO_PROFILE_VP9_PROFILE2:
+   case PIPE_VIDEO_PROFILE_AV1_MAIN:
       is_supported = true;
       break;
    default:
